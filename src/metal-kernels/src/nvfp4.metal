@@ -25,35 +25,38 @@ constexpr constant int kBlockSize = 16;
 constexpr constant int kKTile = kWarpSize * kElemsPerLane;
 constexpr constant int kKTilePadded = kKTile + (kKTile / kWarpSize);
 
-// FP4 E2M1 dequant LUT: maps 3-bit magnitude (nibble & 0x7) to integer 2x the
-// actual float value. {0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0} * 2 = below.
-// The caller applies * 0.5 via the block scale to get correct values.
-constant char kMagLut[8] = {0, 1, 2, 3, 4, 6, 8, 12};
+// FP4 E2M1 float dequant LUT: direct float values for each 4-bit nibble.
+// Positive nibbles 0-7 map to {0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}.
+// Negative nibbles 8-15 map to {-0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0}.
+// Using direct float avoids the int8 intermediate + 0.5f correction roundtrip.
+constant float kFp4Lut[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+};
 
-// Decode FP8 E4M3 to float.
+// Decode FP8 E4M3 to float via IEEE-754 bit reconstruction (matches CUDA exactly).
 // FP8 E4M3: 1 sign bit, 4 exponent bits, 3 mantissa bits, bias = 7
 METAL_FUNC float fp8e4m3_to_float(uchar bits) {
   uint sign = (bits >> 7) & 1;
   uint exp  = (bits >> 3) & 0xF;
   uint mant = bits & 0x7;
 
-  float result;
   if (exp == 0) {
-    // Subnormal: value = 2^(-6) * (mantissa/8)
-    result = float(mant) / 8.0f * exp2(-6.0f);
-  } else if (exp == 15 && mant == 7) {
-    // NaN → treat as 0
-    result = 0.0f;
-  } else {
-    // Normal: value = 2^(exp-7) * (1 + mantissa/8)
-    result = (1.0f + float(mant) / 8.0f) * exp2(float(exp) - 7.0f);
+    if (mant == 0) {
+      return as_type<float>(sign << 31);
+    }
+    // Subnormal: value = (-1)^s * 2^(-6) * mant * 2^(-3) = mant * 2^(-9)
+    float result = float(mant) * 0.001953125f;
+    return sign ? -result : result;
   }
-  return sign ? -result : result;
-}
-
-METAL_FUNC char fp4_to_i8x2(uchar nibble) {
-  char v = kMagLut[nibble & 7];
-  return (nibble & 8) ? char(-v) : v;
+  if (exp == 0xF && mant == 0x7) {
+    return 0.0f;
+  }
+  // Normal: reconstruct as IEEE-754 float32 via bit manipulation (exact)
+  uint new_exp = exp - 7 + 127;
+  uint mant32 = uint(mant) << (23 - 3);
+  uint fbits = (sign << 31) | (new_exp << 23) | mant32;
+  return as_type<float>(fbits);
 }
 
 METAL_FUNC float simdgroup_reduce_sum(float v) {
@@ -67,6 +70,7 @@ METAL_FUNC float simdgroup_reduce_sum(float v) {
 
 // Process one tile of 32 elements per lane (2 NVFP4 blocks of 16).
 // Each lane handles kElemsPerLane = 32 contiguous K elements.
+// Uses direct float LUT for FP4→float (no int8 intermediate, no 0.5f correction).
 template <typename T>
 METAL_FUNC void nvfp4_dot_k1024_tiles(const device uchar *w_row,
                                       const device uchar *s_row,
@@ -88,15 +92,10 @@ METAL_FUNC void nvfp4_dot_k1024_tiles(const device uchar *w_row,
 
   int in_idx = 0;
 
-  // Process 16 bytes = 32 FP4 values (4 x uint32, each containing 8 nibbles)
-  // Every 16 elements uses a new FP8 E4M3 block scale.
-  // First 16 elements: scale from s_row[k_lane / kBlockSize]
-  // Second 16 elements: scale from s_row[(k_lane + 16) / kBlockSize]
-
   // Block 0: elements [0..15]
   {
     const int scale_idx = k_lane / kBlockSize;
-    const float w_scale = fp8e4m3_to_float(s_row[scale_idx]) * global_scale * 0.5f;
+    const float w_scale = fp8e4m3_to_float(s_row[scale_idx]) * global_scale;
 
     float partial = 0.0f;
 
@@ -106,8 +105,8 @@ METAL_FUNC void nvfp4_dot_k1024_tiles(const device uchar *w_row,
       for (int j = 0; j < 4; ++j) {
         const uchar b = uchar(vv & 0xff);
         vv >>= 8;
-        partial = fma(in[in_idx + 0], float(fp4_to_i8x2(b & 0x0f)), partial);
-        partial = fma(in[in_idx + 1], float(fp4_to_i8x2((b >> 4) & 0x0f)), partial);
+        partial = fma(in[in_idx + 0], kFp4Lut[b & 0x0f], partial);
+        partial = fma(in[in_idx + 1], kFp4Lut[(b >> 4) & 0x0f], partial);
         in_idx += 2;
       }
     }
@@ -118,8 +117,8 @@ METAL_FUNC void nvfp4_dot_k1024_tiles(const device uchar *w_row,
       for (int j = 0; j < 4; ++j) {
         const uchar b = uchar(vv & 0xff);
         vv >>= 8;
-        partial = fma(in[in_idx + 0], float(fp4_to_i8x2(b & 0x0f)), partial);
-        partial = fma(in[in_idx + 1], float(fp4_to_i8x2((b >> 4) & 0x0f)), partial);
+        partial = fma(in[in_idx + 0], kFp4Lut[b & 0x0f], partial);
+        partial = fma(in[in_idx + 1], kFp4Lut[(b >> 4) & 0x0f], partial);
         in_idx += 2;
       }
     }
@@ -132,7 +131,7 @@ METAL_FUNC void nvfp4_dot_k1024_tiles(const device uchar *w_row,
     const int k2 = k_lane + kBlockSize;
     if (k2 < K) {
       const int scale_idx2 = k2 / kBlockSize;
-      const float w_scale2 = fp8e4m3_to_float(s_row[scale_idx2]) * global_scale * 0.5f;
+      const float w_scale2 = fp8e4m3_to_float(s_row[scale_idx2]) * global_scale;
 
       float partial2 = 0.0f;
 
@@ -142,8 +141,8 @@ METAL_FUNC void nvfp4_dot_k1024_tiles(const device uchar *w_row,
         for (int j = 0; j < 4; ++j) {
           const uchar b = uchar(vv & 0xff);
           vv >>= 8;
-          partial2 = fma(in[in_idx + 0], float(fp4_to_i8x2(b & 0x0f)), partial2);
-          partial2 = fma(in[in_idx + 1], float(fp4_to_i8x2((b >> 4) & 0x0f)), partial2);
+          partial2 = fma(in[in_idx + 0], kFp4Lut[b & 0x0f], partial2);
+          partial2 = fma(in[in_idx + 1], kFp4Lut[(b >> 4) & 0x0f], partial2);
           in_idx += 2;
         }
       }
@@ -154,8 +153,8 @@ METAL_FUNC void nvfp4_dot_k1024_tiles(const device uchar *w_row,
         for (int j = 0; j < 4; ++j) {
           const uchar b = uchar(vv & 0xff);
           vv >>= 8;
-          partial2 = fma(in[in_idx + 0], float(fp4_to_i8x2(b & 0x0f)), partial2);
-          partial2 = fma(in[in_idx + 1], float(fp4_to_i8x2((b >> 4) & 0x0f)), partial2);
+          partial2 = fma(in[in_idx + 0], kFp4Lut[b & 0x0f], partial2);
+          partial2 = fma(in[in_idx + 1], kFp4Lut[(b >> 4) & 0x0f], partial2);
           in_idx += 2;
         }
       }
