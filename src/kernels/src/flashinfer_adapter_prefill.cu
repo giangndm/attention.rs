@@ -283,7 +283,7 @@ void flashinfer_prefill_plan_wrapper(
     }
 
 #if defined(SM_90_PASS)
-    if (head_dim < 256) {
+    {
         PrefillPlanSM90Info plan_info;
         PrefillSM90Plan<int32_t>(
             workspace_float, workspace_float_size,
@@ -303,8 +303,8 @@ void flashinfer_prefill_plan_wrapper(
                 plan_info_out[1 + i] = vec[i];
             }
         }
-    } else
-#endif
+    }
+#else
     {
         PrefillPlanInfo plan_info;
         PrefillPlan<int32_t>(
@@ -329,6 +329,7 @@ void flashinfer_prefill_plan_wrapper(
             }
         }
     }
+#endif
 #endif
 }
 

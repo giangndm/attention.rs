@@ -848,8 +848,9 @@ pub fn prefill_plan(
 
     let is_fp8 = kv_dtype.map_or(false, |d| d == DType::U8);
     let use_fp8_fa2_plan = is_fp8 && sm >= 90 && head_dim >= 256;
-    // SM90 uses 10-element plan except for FP8 + head_dim >= 256 which needs FA2 plan (16-element)
-    let use_sm90_plan = sm == 90 && head_dim < 256 && !use_fp8_fa2_plan;
+    // SM90 always uses the 10-element SM90 plan for BF16/F16 KV cache (all head_dims).
+    // FP8 KV cache with head_dim >= 256 uses the 16-element FA2 plan.
+    let use_sm90_plan = sm == 90 && !use_fp8_fa2_plan;
     let mut plan_info = vec![0i64; if use_sm90_plan { 10 } else { 16 }];
     unsafe {
         if use_fp8_fa2_plan {
