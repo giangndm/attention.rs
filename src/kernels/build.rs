@@ -56,6 +56,18 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/silu_and_mul.cu");
     println!("cargo:rerun-if-changed=src/concat_and_cache_mla_kernel.cu");
     println!("cargo:rerun-if-changed=src/mla_paged_attention.cu");
+    println!("cargo:rerun-if-changed=src/flash/flash_instantiate.cu");
+    println!("cargo:rerun-if-changed=src/flash/flash_decode.cu");
+    println!("cargo:rerun-if-changed=src/flash/flash_prefill_paged.cuh");
+    println!("cargo:rerun-if-changed=src/flash/flash_prefill_paged_fp8.cuh");
+    println!("cargo:rerun-if-changed=src/flash/flash_decode_paged.cuh");
+    println!("cargo:rerun-if-changed=src/flash/flash_decode_paged_fp8.cuh");
+    println!("cargo:rerun-if-changed=src/flash/flash_reshape_cache.cuh");
+    println!("cargo:rerun-if-changed=src/flash/flash_turboquant.cuh");
+    println!("cargo:rerun-if-changed=src/flash/flash_turboquant_lowbit.cuh");
+    println!("cargo:rerun-if-changed=src/flash/flash_prefill_tq4.cuh");
+    println!("cargo:rerun-if-changed=src/flash/flash_prefill_tq3.cuh");
+    println!("cargo:rerun-if-changed=src/flash/flash_sm_compat.cuh");
 
     let marlin_disabled = std::env::var("CARGO_FEATURE_NO_MARLIN").is_ok();
     let fp8_kvcache_disabled = std::env::var("CARGO_FEATURE_NO_FP8_KVCACHE").is_ok();
@@ -65,16 +77,36 @@ fn main() -> Result<()> {
 
     let mut builder = KernelBuilder::new()
         .source_dir("src")
-        .nvcc_thread_patterns(&["flash_api", "cutlass", "flashinfer"], 2)
+        .nvcc_thread_patterns(&["flash_api", "flash_decode", "cutlass", "flashinfer"], 2)
         .arg("--expt-relaxed-constexpr")
         .arg("-std=c++17")
         .arg("-O3");
+
+    let flash_enabled = std::env::var("CARGO_FEATURE_FLASH").is_ok();
 
     if !trtllm_enabled {
         builder = builder.exclude(&["trtllm/*"]);
     }
 
     let compute_cap = builder.get_compute_cap().unwrap_or(80);
+
+    if !flash_enabled {
+        builder = builder.exclude(&["flash/*"]);
+    } else {
+        builder = builder.arg("-Isrc/flash");
+        if compute_cap <= 70 {
+            println!(
+                "cargo:warning=Native flash kernels using m8n8k4 Tensor Core MMA for SM{}.",
+                compute_cap
+            );
+        } else if compute_cap <= 75 {
+            println!(
+                "cargo:warning=Native flash kernels using FP16 m16n8k8 Tensor Core MMA for SM{}. \
+                 SM80+ uses BF16 m16n8k16 for best performance.",
+                compute_cap
+            );
+        }
+    }
 
     println!("cargo:info=compute capability: {:?}", compute_cap);
 
@@ -127,7 +159,8 @@ fn main() -> Result<()> {
                 builder = builder.arg("-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED");
                 builder = builder.arg("-DSM_90_PASS");
             }
-            if compute_cap >= 80 {
+            let flashinfer_sw_fp8 = std::env::var("ENABLE_FLASHINFER_SOFTWARE_FP8").is_ok();
+            if compute_cap >= 90 || (compute_cap >= 80 && flashinfer_sw_fp8) {
                 builder = builder.arg("-DFLASHINFER_ENABLE_FP8_E4M3");
             }
             if compute_cap >= 90 {

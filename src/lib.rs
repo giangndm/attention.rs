@@ -4,6 +4,9 @@ compile_error!("Enable exactly one backend feature: `cuda` or `metal`, not both.
 #[cfg(not(any(feature = "cuda", feature = "metal")))]
 compile_error!("Enable exactly one backend feature: `cuda` or `metal`.");
 
+#[cfg(all(feature = "flashinfer", feature = "flashattn"))]
+compile_error!("Features `flashinfer` and `flashattn` are mutually exclusive. Enable only one.");
+
 pub mod moe;
 pub mod paged_attention;
 pub mod scale_update;
@@ -37,8 +40,87 @@ pub mod ops;
 pub mod silu_and_mul;
 pub mod swiglu;
 
+#[cfg(feature = "flash")]
+pub mod flash;
+
 #[cfg(feature = "flashinfer")]
 pub mod flashinfer;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurboquantMode {
+    Turbo8,
+    Turbo4,
+    Turbo3,
+}
+
+pub struct TurboquantLayerCache {
+    pub k_absmax: Option<Tensor>,
+    pub k_quant: Option<Tensor>,
+    pub v_absmax: Tensor,
+    pub v_quant: Tensor,
+}
+
+static TURBOQUANT_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<TurboquantGlobalCache>>> =
+    std::sync::OnceLock::new();
+
+pub struct TurboquantGlobalCache {
+    pub mode: TurboquantMode,
+    pub layers: Vec<TurboquantLayerCache>,
+    pub block_size: usize,
+}
+
+pub fn init_turboquant_cache(
+    mode: TurboquantMode,
+    layers: Vec<TurboquantLayerCache>,
+    block_size: usize,
+) {
+    let cache = TURBOQUANT_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = cache.lock().unwrap();
+    *guard = Some(TurboquantGlobalCache {
+        mode,
+        layers,
+        block_size,
+    });
+}
+
+pub fn has_flashinfer_fp8_e4m3() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        unsafe { kernels::ffi::has_flashinfer_fp8_e4m3() }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
+    }
+}
+
+pub fn get_turboquant_mode() -> Option<TurboquantMode> {
+    TURBOQUANT_CACHE
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|g| g.as_ref().map(|c| c.mode))
+}
+
+pub fn get_turboquant_block_size() -> usize {
+    TURBOQUANT_CACHE
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|g| g.as_ref().map(|c| c.block_size))
+        .unwrap_or(16)
+}
+
+pub fn with_turboquant_layer<F, R>(layer_idx: usize, f: F) -> Option<R>
+where
+    F: FnOnce(&TurboquantLayerCache, TurboquantMode) -> R,
+{
+    TURBOQUANT_CACHE
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|g| {
+            g.as_ref()
+                .and_then(|c| c.layers.get(layer_idx).map(|l| f(l, c.mode)))
+        })
+}
 
 #[cfg(feature = "trtllm")]
 pub mod trtllm_cubin_loader;
@@ -75,7 +157,6 @@ pub struct InputMetadata {
     pub max_seqlen_q: usize,
     pub max_seqlen_k: usize,
     pub max_context_len: usize,
-    pub disable_flash_attn: Option<bool>,
     pub seqlens: Option<Vec<u32>>,
     pub flashinfer_metadata: Option<FlashInferMetadata>,
 }
@@ -92,6 +173,19 @@ pub struct PagedAttention {
     k_scale: Option<Tensor>,
     v_scale: Option<Tensor>,
     kv_updated_times: AtomicI32,
+    #[cfg(feature = "flash")]
+    flash_splitk_workspace: std::sync::OnceLock<Tensor>,
+    layer_idx: usize,
+}
+
+static PAGED_ATTENTION_LAYER_COUNTER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+static TQ_DECODE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn reset_paged_attention_layer_counter() {
+    PAGED_ATTENTION_LAYER_COUNTER.store(0, Ordering::SeqCst);
+    TQ_DECODE_LOGGED.store(false, Ordering::SeqCst);
 }
 
 impl PagedAttention {
@@ -162,7 +256,7 @@ impl PagedAttention {
         }
     }
 
-    #[cfg(any(feature = "flashattn", feature = "flashinfer"))]
+    #[cfg(any(feature = "flash", feature = "flashattn", feature = "flashinfer"))]
     fn packed_qkv(
         query: &Tensor,
         key: &Tensor,
@@ -247,6 +341,7 @@ impl PagedAttention {
         } else {
             None
         };
+        let layer_idx = PAGED_ATTENTION_LAYER_COUNTER.fetch_add(1, Ordering::SeqCst);
         Ok(Self {
             num_attention_heads,
             head_dim,
@@ -274,6 +369,9 @@ impl PagedAttention {
                 None
             },
             kv_updated_times: AtomicI32::new(0),
+            #[cfg(feature = "flash")]
+            flash_splitk_workspace: std::sync::OnceLock::new(),
+            layer_idx,
         })
     }
 
@@ -347,8 +445,7 @@ impl PagedAttention {
                 }
 
                 if let Some(mask) = &attention_mask {
-                    //mask needs to be chunked
-                    let q_chunk_mask = mask[i].narrow(2, offset, len)?; // shape: [1, 1, chunk_len, K_len]
+                    let q_chunk_mask = mask[i].narrow(2, offset, len)?;
                     att = att.broadcast_add(&q_chunk_mask)?;
                 }
 
@@ -563,12 +660,41 @@ impl PagedAttention {
         softcapping: Option<f64>,
     ) -> Result<Tensor> {
         // head_dim > 256: FlashAttn/FlashInfer don't support it.
-        // These layers use paged attention format KV cache, so skip flash paths
-        // and fall through to the standard paged attention path below.
-        let use_paged_for_large_head = self.head_dim > 256;
+        // TurboQuant: only native flash path supports turbo KV cache.
+        // Both cases force use of native flash path below.
+
+        #[cfg(feature = "flash")]
+        let force_native_flash =
+            self.head_dim > 256 || input_metadata.flashinfer_metadata.is_none();
+        #[cfg(not(feature = "flash"))]
+        let force_native_flash = false;
+
+        #[cfg(feature = "flashattn")]
+        let skip_flashattn = {
+            let tq = get_turboquant_mode().is_some();
+            let fp8_on_non_sm90 = if self.k_scale.is_some() {
+                #[cfg(feature = "cuda")]
+                {
+                    let sm = query
+                        .device()
+                        .as_cuda_device()
+                        .ok()
+                        .and_then(|d| crate::cuda_utils::sm_version(d))
+                        .unwrap_or(0);
+                    sm != 90 // FP8 kvcache only works on sm90
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    true
+                }
+            } else {
+                false
+            };
+            self.head_dim > 256 || tq || fp8_on_non_sm90
+        };
 
         #[cfg(feature = "flashinfer")]
-        if !use_paged_for_large_head {
+        if !force_native_flash {
             if let Some(fm) = input_metadata.flashinfer_metadata.as_ref() {
                 let (query, key, value, attention_heads, key_value_heads, head_size) =
                     Self::packed_qkv(query, key, value)?;
@@ -675,10 +801,10 @@ impl PagedAttention {
                 );
                 }
             }
-        } // end if !use_paged_for_large_head (flashinfer)
+        } // end if !force_native_flash (flashinfer)
 
         #[cfg(feature = "flashattn")]
-        if !use_paged_for_large_head && !input_metadata.disable_flash_attn.unwrap_or(false) {
+        if !skip_flashattn {
             return self.flash_forward(
                 query,
                 key,
@@ -687,6 +813,350 @@ impl PagedAttention {
                 value_cache,
                 input_metadata,
                 softcapping,
+            );
+        }
+
+        #[cfg(feature = "flash")]
+        {
+            let (query_p, key_p, value_p, attention_heads_p, key_value_heads_p, head_size_p) =
+                Self::packed_qkv(query, key, value)?;
+
+            let slot_mapping = input_metadata.slot_mapping.flatten_all()?;
+
+            let tq_mode = get_turboquant_mode();
+            let tq_bs = get_turboquant_block_size();
+
+            let tq_uses_std_cache = matches!(tq_mode, None | Some(TurboquantMode::Turbo8));
+            // Native flash FP8 path: skip dynamic AMAX scale updates, keep K/V scales at 1.0.
+            // All data stored in FP8 cache uses scale=1.0 (raw BF16→FP8 cast). If we update
+            // scales during decode, previously-stored prefill data would be read with wrong
+            // scale, producing garbage. This matches FlashInfer/FlashAttn behavior.
+            if !input_metadata.is_prefill && tq_uses_std_cache && self.k_scale.is_none() {
+                self.maybe_update_kv_scales(&key_p, &value_p)?;
+            }
+
+            if key_cache.as_ref().is_some_and(|_| value_cache.is_some()) {
+                match tq_mode {
+                    Some(TurboquantMode::Turbo8) => {
+                        // Turbo8: K as FP8 in standard cache, V as FP8 in standard cache
+                        // (for prefill, which uses standard FP8 attention) + V as 4-bit
+                        // in TQ buffers (for decode). flash_tq_store_k8v4 writes K and
+                        // 4-bit V; flash_reshape_and_cache writes FP8 V for prefill use.
+                        crate::flash::flash_reshape_and_cache(
+                            &key_p,
+                            &value_p,
+                            key_cache.as_ref().unwrap(),
+                            value_cache.as_ref().unwrap(),
+                            self.k_scale.as_ref(),
+                            self.v_scale.as_ref(),
+                            &slot_mapping,
+                        )?;
+                        if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
+                            crate::flash::flash_tq_store_k8v4(
+                                &key_p,
+                                &value_p,
+                                key_cache.as_ref().unwrap(),
+                                &tq.v_absmax,
+                                &tq.v_quant,
+                                &slot_mapping,
+                                self.k_scale.as_ref(),
+                            )
+                        }) {
+                            r?;
+                        }
+                    }
+                    Some(TurboquantMode::Turbo4) => {
+                        // Turbo4: both K and V stored ONLY in TQ buffers (no standard cache)
+                        if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
+                            crate::flash::flash_tq4_store(
+                                &key_p,
+                                &value_p,
+                                tq.k_absmax.as_ref().unwrap(),
+                                tq.k_quant.as_ref().unwrap(),
+                                &tq.v_absmax,
+                                &tq.v_quant,
+                                &slot_mapping,
+                                key_value_heads_p,
+                                head_size_p,
+                                tq_bs,
+                            )
+                        }) {
+                            r?;
+                        }
+                    }
+                    Some(TurboquantMode::Turbo3) => {
+                        // Turbo3: both K and V stored ONLY in TQ buffers (no standard cache)
+                        if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
+                            crate::flash::flash_tq3_store(
+                                &key_p,
+                                &value_p,
+                                tq.k_absmax.as_ref().unwrap(),
+                                tq.k_quant.as_ref().unwrap(),
+                                &tq.v_absmax,
+                                &tq.v_quant,
+                                &slot_mapping,
+                                key_value_heads_p,
+                                head_size_p,
+                                tq_bs,
+                            )
+                        }) {
+                            r?;
+                        }
+                    }
+                    None => {
+                        crate::flash::flash_reshape_and_cache(
+                            &key_p,
+                            &value_p,
+                            key_cache.as_ref().unwrap(),
+                            value_cache.as_ref().unwrap(),
+                            self.k_scale.as_ref(),
+                            self.v_scale.as_ref(),
+                            &slot_mapping,
+                        )?;
+                    }
+                }
+            }
+
+            if input_metadata.is_prefill && input_metadata.block_tables.is_none() {
+                return self.sdp_prefill(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    input_metadata,
+                    softcapping,
+                );
+            }
+
+            let block_tables = input_metadata.block_tables.as_ref().unwrap();
+            let context_lens = input_metadata.context_lens.as_ref().unwrap();
+
+            if input_metadata.is_prefill {
+                match tq_mode {
+                    Some(TurboquantMode::Turbo4) => {
+                        let r = with_turboquant_layer(self.layer_idx, |tq, _| {
+                            crate::flash::flash_tq4_prefill(
+                                &query_p,
+                                tq.k_absmax.as_ref().unwrap(),
+                                tq.k_quant.as_ref().unwrap(),
+                                &tq.v_absmax,
+                                &tq.v_quant,
+                                block_tables,
+                                context_lens,
+                                attention_heads_p,
+                                key_value_heads_p,
+                                head_size_p,
+                                self.scale,
+                                softcapping.unwrap_or(0.0) as f32,
+                                self.sliding_window,
+                                tq_bs,
+                                input_metadata.cu_seqlens_q.as_ref(),
+                                input_metadata.max_seqlen_q,
+                            )
+                        });
+                        if let Some(r) = r {
+                            return r;
+                        }
+                    }
+                    Some(TurboquantMode::Turbo3) => {
+                        let r = with_turboquant_layer(self.layer_idx, |tq, _| {
+                            crate::flash::flash_tq3_prefill(
+                                &query_p,
+                                tq.k_absmax.as_ref().unwrap(),
+                                tq.k_quant.as_ref().unwrap(),
+                                &tq.v_absmax,
+                                &tq.v_quant,
+                                block_tables,
+                                context_lens,
+                                attention_heads_p,
+                                key_value_heads_p,
+                                head_size_p,
+                                self.scale,
+                                softcapping.unwrap_or(0.0) as f32,
+                                self.sliding_window,
+                                tq_bs,
+                                input_metadata.cu_seqlens_q.as_ref(),
+                                input_metadata.max_seqlen_q,
+                            )
+                        });
+                        if let Some(r) = r {
+                            return r;
+                        }
+                    }
+                    _ => {
+                        return crate::flash::flash_prefill(
+                            &query_p,
+                            key_cache.as_ref().unwrap(),
+                            value_cache.as_ref().unwrap(),
+                            block_tables,
+                            context_lens,
+                            attention_heads_p,
+                            key_value_heads_p,
+                            head_size_p,
+                            self.scale,
+                            softcapping.unwrap_or(0.0) as f32,
+                            self.sliding_window,
+                            self.k_scale.as_ref(),
+                            self.v_scale.as_ref(),
+                            input_metadata.cu_seqlens_q.as_ref(),
+                            input_metadata.max_seqlen_q,
+                        );
+                    }
+                }
+            }
+
+            let output = query_p.zeros_like()?;
+
+            match tq_mode {
+                Some(ref mode) => {
+                    if !TQ_DECODE_LOGGED.swap(true, Ordering::SeqCst) {
+                        tracing::warn!(
+                            layer = self.layer_idx,
+                            mode = ?mode,
+                            "TurboQuant decode path active"
+                        );
+                    }
+                }
+                None => {}
+            }
+
+            match tq_mode {
+                Some(TurboquantMode::Turbo8) => {
+                    let ws = self.flash_splitk_workspace.get_or_init(|| {
+                        let max_seqs = 64;
+                        let num_splits = crate::flash::TQ_NUM_SPLITS as usize;
+                        let ws_stride = head_size_p + 2;
+                        Tensor::zeros(
+                            (max_seqs * attention_heads_p * num_splits * ws_stride,),
+                            candle_core::DType::F32,
+                            query_p.device(),
+                        )
+                        .unwrap()
+                    });
+                    if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
+                        crate::flash::flash_tq_decode_k8v4_splitk(
+                            &query_p,
+                            key_cache.as_ref().unwrap(),
+                            &tq.v_absmax,
+                            &tq.v_quant,
+                            block_tables,
+                            context_lens,
+                            &output,
+                            input_metadata.max_context_len,
+                            attention_heads_p,
+                            key_value_heads_p,
+                            head_size_p,
+                            self.scale,
+                            softcapping.unwrap_or(0.0) as f32,
+                            self.k_scale.as_ref(),
+                            Some(ws),
+                            self.sliding_window,
+                        )
+                    }) {
+                        return r;
+                    }
+                }
+                Some(TurboquantMode::Turbo4) => {
+                    let ws = self.flash_splitk_workspace.get_or_init(|| {
+                        let max_seqs = 64;
+                        let num_splits = crate::flash::TQ_NUM_SPLITS as usize;
+                        let ws_stride = head_size_p + 2;
+                        Tensor::zeros(
+                            (max_seqs * attention_heads_p * num_splits * ws_stride,),
+                            candle_core::DType::F32,
+                            query_p.device(),
+                        )
+                        .unwrap()
+                    });
+                    if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
+                        crate::flash::flash_tq4_decode(
+                            &query_p,
+                            tq.k_absmax.as_ref().unwrap(),
+                            tq.k_quant.as_ref().unwrap(),
+                            &tq.v_absmax,
+                            &tq.v_quant,
+                            block_tables,
+                            context_lens,
+                            &output,
+                            attention_heads_p,
+                            key_value_heads_p,
+                            head_size_p,
+                            input_metadata.max_context_len,
+                            self.scale,
+                            softcapping.unwrap_or(0.0) as f32,
+                            self.sliding_window,
+                            Some(ws),
+                        )
+                    }) {
+                        return r;
+                    }
+                }
+                Some(TurboquantMode::Turbo3) => {
+                    let ws = self.flash_splitk_workspace.get_or_init(|| {
+                        let max_seqs = 64;
+                        let num_splits = crate::flash::TQ_NUM_SPLITS as usize;
+                        let ws_stride = head_size_p + 2;
+                        Tensor::zeros(
+                            (max_seqs * attention_heads_p * num_splits * ws_stride,),
+                            candle_core::DType::F32,
+                            query_p.device(),
+                        )
+                        .unwrap()
+                    });
+                    if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
+                        crate::flash::flash_tq3_decode(
+                            &query_p,
+                            tq.k_absmax.as_ref().unwrap(),
+                            tq.k_quant.as_ref().unwrap(),
+                            &tq.v_absmax,
+                            &tq.v_quant,
+                            block_tables,
+                            context_lens,
+                            &output,
+                            attention_heads_p,
+                            key_value_heads_p,
+                            head_size_p,
+                            input_metadata.max_context_len,
+                            self.scale,
+                            softcapping.unwrap_or(0.0) as f32,
+                            self.sliding_window,
+                            Some(ws),
+                        )
+                    }) {
+                        return r;
+                    }
+                }
+                None => {}
+            }
+
+            let ws = self.flash_splitk_workspace.get_or_init(|| {
+                let max_seqs = 64;
+                let num_splits = crate::flash::NUM_SPLITS as usize;
+                let ws_stride = head_size_p + 2;
+                Tensor::zeros(
+                    (max_seqs * attention_heads_p * num_splits * ws_stride,),
+                    candle_core::DType::F32,
+                    query_p.device(),
+                )
+                .unwrap()
+            });
+            return crate::flash::flash_decode(
+                &query_p,
+                key_cache.as_ref().unwrap(),
+                value_cache.as_ref().unwrap(),
+                block_tables,
+                context_lens,
+                &output,
+                input_metadata.max_context_len,
+                attention_heads_p,
+                key_value_heads_p,
+                head_size_p,
+                self.scale,
+                softcapping.unwrap_or(0.0) as f32,
+                self.sliding_window,
+                self.k_scale.as_ref(),
+                self.v_scale.as_ref(),
+                Some(ws),
             );
         }
 
