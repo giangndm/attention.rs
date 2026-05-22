@@ -44,9 +44,15 @@ using namespace cute;
 // SM100 MXFP4 Dense GEMM Kernel Configurations
 // Following FlashInfer mxfp8_gemm_template_sm100.h patterns for CUTLASS 4.4.2
 // Only compiled when targeting SM100-SM119 (datacenter Blackwell)
+//
+// NOTE: Disabled until CUTLASS CollectiveBuilder gains full support for
+// OpClassBlockScaledTensorOp with MX-format scales (float_e2m1_t +
+// float_ue8m0_t) on SM100.  The NVFP4 path (float_ue4m3_t scales)
+// already works; this MX variant needs a newer CUTLASS revision.
+// SM100 falls back to software-dequant MXFP4 kernels at runtime.
 // ============================================================================
 
-#if defined(ENABLE_FP4_SM100)
+#if defined(ENABLE_FP4_SM100) && defined(CUTLASS_MXFP4_SM100_READY)
 
 struct _1SM {};
 struct _2SM {};
@@ -156,7 +162,7 @@ struct CutlassMxfp4Gemm {
   using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
 };
 
-#endif // ENABLE_FP4_SM100
+#endif // ENABLE_FP4_SM100 && CUTLASS_MXFP4_SM100_READY
 
 // ============================================================================
 // SM120 (Blackwell consumer) MXFP4 Dense GEMM
@@ -328,7 +334,7 @@ static void run_mxfp4_gemm(
   }
 }
 
-#if defined(ENABLE_FP4_SM100)
+#if defined(ENABLE_FP4_SM100) && defined(CUTLASS_MXFP4_SM100_READY)
 template <typename OutType>
 static void dispatch_mxfp4_gemm_sm100(
     void* D, const void* A, const void* B,
@@ -351,7 +357,7 @@ static void dispatch_mxfp4_gemm_sm100(
                             dim3(1, 4, 1), dim3(1, 2, 1), workspace, workspace_bytes, stream);
   }
 }
-#endif // ENABLE_FP4_SM100
+#endif // ENABLE_FP4_SM100 && CUTLASS_MXFP4_SM100_READY
 
 #if defined(ENABLE_FP4_SM120)
 template <typename OutType>
@@ -396,7 +402,7 @@ void mxfp4_cutlass_gemm_f16(
   run_mxfp4_gemm_sm120<cutlass::half_t>(
       output, input, weight, input_sf, weight_sf, M, N, K,
       workspace, static_cast<size_t>(workspace_bytes), s);
-#elif defined(ENABLE_FP4_SM100)
+#elif defined(ENABLE_FP4_SM100) && defined(CUTLASS_MXFP4_SM100_READY)
   dispatch_mxfp4_gemm_sm100<cutlass::half_t>(
       output, input, weight, input_sf, weight_sf, M, N, K,
       workspace, static_cast<size_t>(workspace_bytes), s);
@@ -418,7 +424,7 @@ void mxfp4_cutlass_gemm_bf16(
   run_mxfp4_gemm_sm120<cutlass::bfloat16_t>(
       output, input, weight, input_sf, weight_sf, M, N, K,
       workspace, static_cast<size_t>(workspace_bytes), s);
-#elif defined(ENABLE_FP4_SM100)
+#elif defined(ENABLE_FP4_SM100) && defined(CUTLASS_MXFP4_SM100_READY)
   dispatch_mxfp4_gemm_sm100<cutlass::bfloat16_t>(
       output, input, weight, input_sf, weight_sf, M, N, K,
       workspace, static_cast<size_t>(workspace_bytes), s);
