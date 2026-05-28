@@ -2744,7 +2744,10 @@ pub fn moe_gemm_gguf(
 
         assert!(size_k % 8 == 0, "size_k must divisible by 8");
         unsafe {
-            if is_prefill {
+            // The WMMA prefill kernel is also faster for large batched decode
+            // on GGUF MoE models. Keep small/medium decode on the original
+            // kernels to avoid regressions at batch 8-16.
+            if is_prefill || size_m >= 256 {
                 let input = input.to_dtype(dtype)?;
                 let (input, _) = input.storage_and_layout();
                 let (input_ptr, input_dtype) = match &*input {

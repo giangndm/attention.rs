@@ -225,14 +225,14 @@ pub fn nvfp4_matmul(
 
             let use_flashinfer_fp4 = cfg!(feature = "flashinfer")
                 && is_flashinfer_fp4_available(dev)
-                && is_prefill
+                && (is_prefill || m >= 8)
                 && n % 32 == 0
                 && k % 32 == 0;
 
             let use_hardware_fp4 = !use_flashinfer_fp4
                 && cfg!(feature = "cutlass")
                 && is_hardware_fp4_available(dev)
-                && is_prefill
+                && (is_prefill || m >= 8)
                 && n % 32 == 0
                 && k % 32 == 0;
 
