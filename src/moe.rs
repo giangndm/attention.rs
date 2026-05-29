@@ -9,9 +9,89 @@ use candle_core::{Result, Tensor};
 #[cfg(feature = "cuda")]
 use kernels::ffi;
 
+const NVFP4_GROUPED_DECODE_MIN_SLOTS: usize = 256;
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Nvfp4MoeSortCacheKey {
+    ptr: u64,
+    len: usize,
+}
+
+#[cfg(feature = "cuda")]
+struct Nvfp4MoeSortCacheEntry {
+    key: Nvfp4MoeSortCacheKey,
+    _indices: Tensor,
+    sorted_expert_ids: Tensor,
+    sorted_token_ids: Tensor,
+}
+
+#[cfg(feature = "cuda")]
+thread_local! {
+    static NVFP4_MOE_SORT_CACHE: std::cell::RefCell<Option<Nvfp4MoeSortCacheEntry>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(feature = "cuda")]
 fn pad_to(val: usize, align: usize) -> usize {
     (val + align - 1) / align * align
+}
+
+fn should_use_nvfp4_grouped_hardware_moe(
+    is_prefill: bool,
+    total_slots: usize,
+    n: usize,
+    k: usize,
+    sm: i32,
+) -> bool {
+    sm >= 100
+        && n % 32 == 0
+        && k % 32 == 0
+        && (is_prefill || total_slots >= NVFP4_GROUPED_DECODE_MIN_SLOTS)
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_u32_tensor_ptr(tensor: &Tensor) -> Result<u64> {
+    let (storage, _) = tensor.storage_and_layout();
+    match &*storage {
+        candle_core::Storage::Cuda(cuda) => Ok(*cuda.as_cuda_slice::<u32>()?.device_ptr()),
+        _ => candle_core::bail!("tensor must be on CUDA"),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn sorted_nvfp4_moe_assignments(indices: &Tensor) -> Result<(Tensor, Tensor)> {
+    use crate::sort::ArgSortOp;
+
+    let flat_indices = indices.flatten_all()?.contiguous()?;
+    let key = Nvfp4MoeSortCacheKey {
+        ptr: cuda_u32_tensor_ptr(&flat_indices)?,
+        len: flat_indices.elem_count(),
+    };
+
+    if let Some(hit) = NVFP4_MOE_SORT_CACHE.with(|cache| {
+        cache.borrow().as_ref().and_then(|entry| {
+            (entry.key == key).then(|| {
+                (
+                    entry.sorted_expert_ids.clone(),
+                    entry.sorted_token_ids.clone(),
+                )
+            })
+        })
+    }) {
+        return Ok(hit);
+    }
+
+    let (sorted_expert_ids, sorted_token_ids) = flat_indices.sort(true)?;
+    NVFP4_MOE_SORT_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some(Nvfp4MoeSortCacheEntry {
+            key,
+            _indices: flat_indices,
+            sorted_expert_ids: sorted_expert_ids.clone(),
+            sorted_token_ids: sorted_token_ids.clone(),
+        });
+    });
+    Ok((sorted_expert_ids, sorted_token_ids))
 }
 
 #[cfg(test)]
@@ -1301,6 +1381,41 @@ pub fn moe_gemm_nvfp4(
 
     let dev = input.device();
     let cuda_dev = dev.as_cuda_device()?;
+    let total_slots = num_tokens * topk;
+
+    #[cfg(feature = "cutlass")]
+    {
+        let sm = crate::cuda_utils::sm_version(cuda_dev).unwrap_or(0);
+        if should_use_nvfp4_grouped_hardware_moe(is_prefill, total_slots, n, k, sm) {
+            let (sorted_expert_ids, sorted_token_ids) = if let Some((stids, seids)) = pre_sorted {
+                (seids.clone(), stids.clone())
+            } else {
+                sorted_nvfp4_moe_assignments(&indices)?
+            };
+
+            let routed_input = if input_has_topk_dim {
+                input.reshape((num_tokens * topk, k))?
+            } else {
+                input.clone()
+            };
+
+            let topk_w_opt = topk_weights.cloned();
+            let output = moe_gemm_nvfp4_hardware(
+                &routed_input,
+                &weights,
+                &weight_scales,
+                &weight_global_scales,
+                input_scales,
+                &topk_w_opt,
+                &sorted_token_ids,
+                &sorted_expert_ids,
+                topk,
+                is_prefill,
+                weight_scales_swizzled,
+            )?;
+            return output.reshape((num_tokens, topk, n));
+        }
+    }
 
     // During prefill, sort by expert and dispatch to grouped kernels:
     // hardware FP4 (SM100+) or software WMMA (SM80+).
@@ -1314,7 +1429,6 @@ pub fn moe_gemm_nvfp4(
             let flat_indices = indices.flatten_all()?.contiguous()?;
             flat_indices.sort(true)?
         };
-        let total_slots = num_tokens * topk;
 
         #[cfg(feature = "cutlass")]
         {
@@ -2910,7 +3024,9 @@ pub fn moe_gemm_gguf(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_routed_rows_metadata, RoutedRowsMetadata};
+    use super::{
+        build_routed_rows_metadata, should_use_nvfp4_grouped_hardware_moe, RoutedRowsMetadata,
+    };
 
     fn assert_metadata_eq(actual: RoutedRowsMetadata, expected: RoutedRowsMetadata) {
         assert_eq!(actual.sorted_token_ids, expected.sorted_token_ids);
@@ -2955,5 +3071,15 @@ mod tests {
             total_expanded: 4,
         };
         assert_metadata_eq(actual, expected);
+    }
+
+    #[test]
+    fn nvfp4_grouped_hardware_moe_policy_covers_large_decode_only() {
+        assert!(should_use_nvfp4_grouped_hardware_moe(false, 256, 128, 512, 100));
+        assert!(should_use_nvfp4_grouped_hardware_moe(true, 8, 128, 512, 100));
+        assert!(!should_use_nvfp4_grouped_hardware_moe(false, 128, 128, 512, 100));
+        assert!(!should_use_nvfp4_grouped_hardware_moe(false, 256, 128, 512, 90));
+        assert!(!should_use_nvfp4_grouped_hardware_moe(false, 256, 100, 512, 100));
+        assert!(!should_use_nvfp4_grouped_hardware_moe(false, 256, 128, 520, 100));
     }
 }
