@@ -728,23 +728,42 @@ impl MambaCache {
     }
 
     fn touch_prefix_state(&mut self, hash: u64, preserve: bool) {
-        let preserve = preserve || self.preserved_prefix_states.contains(&hash);
+        let already_preserved = self.preserved_prefix_states.contains(&hash);
+        let preserve = preserve || already_preserved;
         self.prefix_lru.retain(|&h| h != hash);
-        self.preserved_prefix_lru.retain(|&h| h != hash);
         if preserve {
             self.preserved_prefix_states.insert(hash);
-            self.preserved_prefix_lru.push_back(hash);
+            if !already_preserved {
+                self.preserved_prefix_lru.retain(|&h| h != hash);
+                self.preserved_prefix_lru.push_back(hash);
+            }
         } else {
             self.preserved_prefix_states.remove(&hash);
+            self.preserved_prefix_lru.retain(|&h| h != hash);
             self.prefix_lru.push_back(hash);
         }
     }
 
-    fn remove_prefix_state(&mut self, hash: u64) {
+    pub fn remove_prefix_state(&mut self, hash: u64) {
         self.prefix_states.remove(&hash);
         self.preserved_prefix_states.remove(&hash);
         self.prefix_lru.retain(|&h| h != hash);
         self.preserved_prefix_lru.retain(|&h| h != hash);
+    }
+
+    fn make_room_for_prefix_state(&mut self) -> bool {
+        while self.prefix_states.len() >= self.prefix_cache_capacity {
+            if let Some(hash) = self.prefix_lru.pop_front() {
+                self.remove_prefix_state(hash);
+                continue;
+            }
+
+            let Some(hash) = self.preserved_prefix_lru.pop_back() else {
+                return false;
+            };
+            self.remove_prefix_state(hash);
+        }
+        true
     }
 
     fn evict_prefix_states_if_needed(&mut self) {
@@ -753,7 +772,7 @@ impl MambaCache {
                 self.remove_prefix_state(hash);
                 continue;
             }
-            let Some(hash) = self.preserved_prefix_lru.pop_front() else {
+            let Some(hash) = self.preserved_prefix_lru.pop_back() else {
                 break;
             };
             self.remove_prefix_state(hash);
@@ -776,6 +795,14 @@ impl MambaCache {
             return Ok(false);
         }
 
+        // Evict before capture so we never exceed capacity (avoids transient OOM
+        // from holding capacity+1 snapshots while the new one is being created).
+        if !self.prefix_states.contains_key(&hash) {
+            if !self.make_room_for_prefix_state() {
+                return Ok(false);
+            }
+        }
+
         let device = self.conv_states[0].device();
         let slot_tensor = Tensor::from_vec(vec![slot as i64], (1,), device)?;
         let mut conv_states = Vec::with_capacity(self.num_gdn_layers);
@@ -793,7 +820,6 @@ impl MambaCache {
             },
         );
         self.touch_prefix_state(hash, preserve);
-        self.evict_prefix_states_if_needed();
         Ok(true)
     }
 
