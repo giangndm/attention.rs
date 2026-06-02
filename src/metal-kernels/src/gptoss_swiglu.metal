@@ -36,6 +36,6 @@ template <typename T>
 
 instantiate_gptoss_swiglu(float);
 instantiate_gptoss_swiglu(half);
-#if __METAL_VERSION__ >= 310
+#if defined(__HAVE_BFLOAT__)
 instantiate_gptoss_swiglu(bfloat);
 #endif

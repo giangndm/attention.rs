@@ -106,8 +106,8 @@ kernel void mlx_nvfp4_dequant_embedding_kernel<half>(
     constant uint&, constant uint&, uint);
 
 template [[host_name("mlx_nvfp4_dequant_embedding_bf16")]]
-kernel void mlx_nvfp4_dequant_embedding_kernel<bfloat>(
-    device const uint32_t*, device const uint8_t*, device bfloat*,
+kernel void mlx_nvfp4_dequant_embedding_kernel<bfloat16_t>(
+    device const uint32_t*, device const uint8_t*, device bfloat16_t*,
     constant uint&, constant uint&, uint);
 
 }  // namespace mlx_nvfp4
