@@ -191,6 +191,24 @@ pub fn reset_paged_attention_layer_counter() {
     TQ_DECODE_LOGGED.store(false, Ordering::SeqCst);
 }
 
+#[cfg(feature = "flash")]
+fn flash_splitk_workspace(
+    max_context_len: usize,
+    max_seqs: usize,
+    num_splits: usize,
+    attention_heads: usize,
+    head_size: usize,
+    device: &Device,
+) -> Result<Option<Tensor>> {
+    if max_context_len < crate::flash::SPLIT_K_THRESHOLD {
+        return Ok(None);
+    }
+
+    let ws_stride = head_size + 2;
+    let ws_len = max_seqs.max(1) * attention_heads * num_splits * ws_stride;
+    Tensor::zeros((ws_len,), candle_core::DType::F32, device).map(Some)
+}
+
 impl PagedAttention {
     fn batch_major_qkv(
         query: &Tensor,
@@ -1030,17 +1048,14 @@ impl PagedAttention {
 
             match tq_mode {
                 Some(TurboquantMode::Turbo8) => {
-                    let ws = self.flash_splitk_workspace.get_or_init(|| {
-                        let max_seqs = 64;
-                        let num_splits = crate::flash::TQ_NUM_SPLITS as usize;
-                        let ws_stride = head_size_p + 2;
-                        Tensor::zeros(
-                            (max_seqs * attention_heads_p * num_splits * ws_stride,),
-                            candle_core::DType::F32,
-                            query_p.device(),
-                        )
-                        .unwrap()
-                    });
+                    let ws = flash_splitk_workspace(
+                        input_metadata.max_context_len,
+                        query_p.dim(0)?,
+                        crate::flash::TQ_NUM_SPLITS as usize,
+                        attention_heads_p,
+                        head_size_p,
+                        query_p.device(),
+                    )?;
                     if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
                         crate::flash::flash_tq_decode_k8v4_splitk(
                             &query_p,
@@ -1057,7 +1072,7 @@ impl PagedAttention {
                             self.scale,
                             softcapping.unwrap_or(0.0) as f32,
                             self.k_scale.as_ref(),
-                            Some(ws),
+                            ws.as_ref(),
                             self.sliding_window,
                         )
                     }) {
@@ -1065,17 +1080,14 @@ impl PagedAttention {
                     }
                 }
                 Some(TurboquantMode::Turbo4) => {
-                    let ws = self.flash_splitk_workspace.get_or_init(|| {
-                        let max_seqs = 64;
-                        let num_splits = crate::flash::TQ_NUM_SPLITS as usize;
-                        let ws_stride = head_size_p + 2;
-                        Tensor::zeros(
-                            (max_seqs * attention_heads_p * num_splits * ws_stride,),
-                            candle_core::DType::F32,
-                            query_p.device(),
-                        )
-                        .unwrap()
-                    });
+                    let ws = flash_splitk_workspace(
+                        input_metadata.max_context_len,
+                        query_p.dim(0)?,
+                        crate::flash::TQ_NUM_SPLITS as usize,
+                        attention_heads_p,
+                        head_size_p,
+                        query_p.device(),
+                    )?;
                     if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
                         crate::flash::flash_tq4_decode(
                             &query_p,
@@ -1093,24 +1105,21 @@ impl PagedAttention {
                             self.scale,
                             softcapping.unwrap_or(0.0) as f32,
                             self.sliding_window,
-                            Some(ws),
+                            ws.as_ref(),
                         )
                     }) {
                         return r;
                     }
                 }
                 Some(TurboquantMode::Turbo3) => {
-                    let ws = self.flash_splitk_workspace.get_or_init(|| {
-                        let max_seqs = 64;
-                        let num_splits = crate::flash::TQ_NUM_SPLITS as usize;
-                        let ws_stride = head_size_p + 2;
-                        Tensor::zeros(
-                            (max_seqs * attention_heads_p * num_splits * ws_stride,),
-                            candle_core::DType::F32,
-                            query_p.device(),
-                        )
-                        .unwrap()
-                    });
+                    let ws = flash_splitk_workspace(
+                        input_metadata.max_context_len,
+                        query_p.dim(0)?,
+                        crate::flash::TQ_NUM_SPLITS as usize,
+                        attention_heads_p,
+                        head_size_p,
+                        query_p.device(),
+                    )?;
                     if let Some(r) = with_turboquant_layer(self.layer_idx, |tq, _| {
                         crate::flash::flash_tq3_decode(
                             &query_p,
@@ -1128,7 +1137,7 @@ impl PagedAttention {
                             self.scale,
                             softcapping.unwrap_or(0.0) as f32,
                             self.sliding_window,
-                            Some(ws),
+                            ws.as_ref(),
                         )
                     }) {
                         return r;
@@ -1137,17 +1146,14 @@ impl PagedAttention {
                 None => {}
             }
 
-            let ws = self.flash_splitk_workspace.get_or_init(|| {
-                let max_seqs = 64;
-                let num_splits = crate::flash::NUM_SPLITS as usize;
-                let ws_stride = head_size_p + 2;
-                Tensor::zeros(
-                    (max_seqs * attention_heads_p * num_splits * ws_stride,),
-                    candle_core::DType::F32,
-                    query_p.device(),
-                )
-                .unwrap()
-            });
+            let ws = flash_splitk_workspace(
+                input_metadata.max_context_len,
+                query_p.dim(0)?,
+                crate::flash::NUM_SPLITS as usize,
+                attention_heads_p,
+                head_size_p,
+                query_p.device(),
+            )?;
             return crate::flash::flash_decode(
                 &query_p,
                 key_cache.as_ref().unwrap(),
@@ -1164,7 +1170,7 @@ impl PagedAttention {
                 self.sliding_window,
                 self.k_scale.as_ref(),
                 self.v_scale.as_ref(),
-                Some(ws),
+                ws.as_ref(),
             );
         }
 
