@@ -7,6 +7,9 @@ compile_error!("Enable exactly one backend feature: `cuda` or `metal`.");
 #[cfg(all(feature = "flashinfer", feature = "flashattn"))]
 compile_error!("Features `flashinfer` and `flashattn` are mutually exclusive. Enable only one.");
 
+#[cfg(feature = "flashattn")]
+compile_error!("The legacy flashattn_rs integration is intentionally disabled in this workspace; use attention-rs `flash` or `flashinfer` kernels instead.");
+
 pub mod moe;
 pub mod paged_attention;
 pub mod scale_update;

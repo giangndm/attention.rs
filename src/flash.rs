@@ -41,6 +41,35 @@ fn get_cuda_stream(dev: &candle::CudaDevice) -> i64 {
 }
 
 #[cfg(feature = "cuda")]
+fn validate_native_flash_head_dim(head_dim: usize, op: &str) -> Result<()> {
+    if matches!(head_dim, 128 | 256 | 512) {
+        Ok(())
+    } else {
+        candle::bail!("{op} supports head_dim 128, 256, or 512, got {head_dim}")
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn validate_native_flash_prefill_bf16_head_dim(head_dim: usize) -> Result<()> {
+    if matches!(head_dim, 64 | 128 | 256 | 512) {
+        Ok(())
+    } else {
+        candle::bail!("flash_prefill supports BF16 head_dim 64, 128, 256, or 512, got {head_dim}")
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn validate_native_flash_cache_head_dim(head_dim: usize, is_fp8: bool) -> Result<()> {
+    if is_fp8 {
+        validate_native_flash_head_dim(head_dim, "flash_reshape_and_cache fp8")
+    } else if matches!(head_dim, 64 | 128 | 256 | 512) {
+        Ok(())
+    } else {
+        candle::bail!("flash_reshape_and_cache supports head_dim 64, 128, 256, or 512, got {head_dim}")
+    }
+}
+
+#[cfg(feature = "cuda")]
 fn ptr_from_tensor(t: &Tensor) -> Result<*const std::ffi::c_void> {
     let (storage, layout) = t.storage_and_layout();
     let cuda_storage = match &*storage {
@@ -97,6 +126,8 @@ pub fn flash_reshape_and_cache(
 
     let (num_tokens, num_kv_heads, head_dim) = key.dims3()?;
     let block_size = key_cache.dim(1)?;
+    let is_fp8 = key_cache.dtype() == DType::U8;
+    validate_native_flash_cache_head_dim(head_dim, is_fp8)?;
 
     let key_ptr = ptr_from_tensor(key)?;
     let value_ptr = ptr_from_tensor(value)?;
@@ -112,8 +143,6 @@ pub fn flash_reshape_and_cache(
         let slice = s.as_cuda_slice::<i64>()?;
         *slice.slice(l.start_offset()..).device_ptr() as *const i64
     };
-
-    let is_fp8 = key_cache.dtype() == DType::U8;
 
     if is_fp8 {
         let ks_ptr = scale_gpu_ptr(k_scale)?;
@@ -171,6 +200,45 @@ pub fn flash_prefill(
     cu_seqlens_q: Option<&Tensor>,
     max_seqlen_q: usize,
 ) -> Result<Tensor> {
+    flash_prefill_with_causal(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        context_lens,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        scale,
+        softcap,
+        sliding_window,
+        k_scale,
+        v_scale,
+        cu_seqlens_q,
+        max_seqlen_q,
+        true,
+    )
+}
+
+#[cfg(feature = "cuda")]
+pub fn flash_prefill_with_causal(
+    query: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    block_table: &Tensor,
+    context_lens: &Tensor,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    softcap: f32,
+    sliding_window: Option<usize>,
+    k_scale: Option<&Tensor>,
+    v_scale: Option<&Tensor>,
+    cu_seqlens_q: Option<&Tensor>,
+    max_seqlen_q: usize,
+    causal: bool,
+) -> Result<Tensor> {
     let dev = match query.device() {
         candle::Device::Cuda(d) => d,
         _ => candle::bail!("flash_prefill requires CUDA"),
@@ -179,6 +247,12 @@ pub fn flash_prefill(
 
     let q_len = query.dim(0)?;
     let block_size = key_cache.dim(1)?;
+    let is_fp8 = key_cache.dtype() == DType::U8;
+    if is_fp8 {
+        validate_native_flash_head_dim(head_dim, "flash_prefill fp8")?;
+    } else {
+        validate_native_flash_prefill_bf16_head_dim(head_dim)?;
+    }
 
     let o = Tensor::zeros_like(query)?;
 
@@ -187,7 +261,6 @@ pub fn flash_prefill(
     let vc_ptr = ptr_from_tensor(value_cache)?;
     let o_ptr = ptr_from_tensor(&o)? as *mut std::ffi::c_void;
 
-    let is_fp8 = key_cache.dtype() == DType::U8;
     let sw = sliding_window.unwrap_or(0) as u32;
 
     let block_table_stride = block_table.dim(1)? as u32;
@@ -239,7 +312,7 @@ pub fn flash_prefill(
                 head_dim as u32,
                 block_size as u32,
                 sw,
-                1,
+                causal as u32,
                 scale,
                 softcap,
                 ks_ptr,
@@ -266,7 +339,7 @@ pub fn flash_prefill(
                 head_dim as u32,
                 block_size as u32,
                 sw,
-                1,
+                causal as u32,
                 scale,
                 softcap,
                 stream,
@@ -307,6 +380,7 @@ pub fn flash_decode(
     let stream = get_cuda_stream(dev);
 
     let num_seqs = query.dim(0)?;
+    validate_native_flash_head_dim(head_dim, "flash_decode")?;
     let block_size = key_cache.dim(1)?;
     let q_stride = (num_q_heads * head_dim) as u32;
 

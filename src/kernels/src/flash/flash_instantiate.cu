@@ -41,6 +41,35 @@
 // We undef FLASH_HDIM before each include and rename via preprocessor
 
 // ============================================================================
+// HDIM=64 BF16 prefill/cache variants
+// ============================================================================
+#define FLASH_HDIM 64
+#define flash_prefill_paged flash_prefill_paged_64
+#define flash_reshape_and_cache flash_reshape_and_cache_64
+#define flash_reshape_and_cache_fp8 flash_reshape_and_cache_fp8_64
+#define flash_bf16_absmax flash_bf16_absmax_64
+
+#include "flash_prefill_paged.cuh"
+#include "flash_reshape_cache.cuh"
+
+#undef FLASH_HDIM
+#undef flash_prefill_paged
+#undef flash_reshape_and_cache
+#undef flash_reshape_and_cache_fp8
+#undef flash_bf16_absmax
+#undef BR
+#undef BC
+#undef PAD_KV
+#undef HDIM
+#undef HDIM_PAD
+#undef PAD_P
+#undef N_TILES_PER_WARP
+#undef TILE_CHUNKS
+#undef NUM_THREADS
+#undef WARP_SIZE
+#undef LOAD_KV_TILE_BF16
+
+// ============================================================================
 // HDIM=128 variants
 // ============================================================================
 #define FLASH_HDIM 128
@@ -428,7 +457,9 @@ extern "C" void call_flash_prefill_paged(
             num_q_heads, num_kv_heads, \
             head_dim, cache_block_size, sliding_window, causal, inv_sqrt_d, softcap)
 
-    if (head_dim <= 128) {
+    if (head_dim <= 64) {
+        LAUNCH_PREFILL(64, 128, 0);
+    } else if (head_dim <= 128) {
         LAUNCH_PREFILL(128, 128, 0);
     } else if (head_dim <= 256) {
         unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
@@ -577,7 +608,8 @@ extern "C" void call_flash_reshape_and_cache_bf16(
             (flash_half_t*)key_cache, (flash_half_t*)value_cache, \
             slot_mapping, num_tokens, num_kv_heads, head_dim, cache_block_size)
 
-    if (head_dim <= 128) { LAUNCH_CACHE(128); }
+    if (head_dim <= 64) { LAUNCH_CACHE(64); }
+    else if (head_dim <= 128) { LAUNCH_CACHE(128); }
     else if (head_dim <= 256) { LAUNCH_CACHE(256); }
     else { LAUNCH_CACHE(512); }
     #undef LAUNCH_CACHE
