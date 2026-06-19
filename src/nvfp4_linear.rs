@@ -160,7 +160,7 @@ pub fn nvfp4_matmul(
     weight_global_scale: f32,
     input_scale: f32,
     bias: Option<&Tensor>,
-    is_prefill: bool,
+    _is_prefill: bool,
     weight_scale_swizzled: Option<&Tensor>,
 ) -> Result<Tensor> {
     let input = if input.is_contiguous() {
@@ -223,18 +223,16 @@ pub fn nvfp4_matmul(
                 }
             }
 
+            let fp4_shape_supported = n % 32 == 0 && k % 32 == 0;
+            let hardware_fp4_available = is_hardware_fp4_available(dev);
             let use_flashinfer_fp4 = cfg!(feature = "flashinfer")
                 && is_flashinfer_fp4_available(dev)
-                && (is_prefill || m >= 8)
-                && n % 32 == 0
-                && k % 32 == 0;
+                && fp4_shape_supported;
 
             let use_hardware_fp4 = !use_flashinfer_fp4
                 && cfg!(feature = "cutlass")
-                && is_hardware_fp4_available(dev)
-                && (is_prefill || m >= 8)
-                && n % 32 == 0
-                && k % 32 == 0;
+                && hardware_fp4_available
+                && fp4_shape_supported;
 
             let output = Tensor::zeros((m, n), dtype, dev)?;
             let has_bias = bias.is_some();
@@ -470,7 +468,9 @@ pub fn nvfp4_matmul(
                                 );
                             }
                             DType::BF16 => {
-                                ffi::nvfp4_matmul_smallm_bf16(
+                                // The BF16 small-M kernel corrupts one-token NVFP4 decode for modelopt checkpoints.
+                                // Keep BF16 on the generic software path unless a focused numeric test proves small-M safe.
+                                ffi::nvfp4_matmul_bf16(
                                     input_ptr,
                                     weight_ptr,
                                     scale_ptr,
