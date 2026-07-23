@@ -7,6 +7,58 @@ use candle::cuda_backend::cudarc::driver::DevicePtr;
 use std::ffi::c_int;
 
 #[cfg(feature = "cuda")]
+fn checked_u32(value: usize, name: &str, op: &str) -> Result<u32> {
+    u32::try_from(value)
+        .map_err(|_| candle::Error::msg(format!("{op}: {name}={value} exceeds u32")))
+}
+
+#[cfg(feature = "cuda")]
+fn validate_tensor(
+    tensor: &Tensor,
+    name: &str,
+    op: &str,
+    rank: usize,
+    dtype: DType,
+    device: &candle::Device,
+) -> Result<()> {
+    if tensor.dims().len() != rank {
+        candle::bail!(
+            "{op}: {name} must have rank {rank}, got shape {:?}",
+            tensor.dims()
+        );
+    }
+    if tensor.dtype() != dtype {
+        candle::bail!(
+            "{op}: {name} must have dtype {dtype:?}, got {:?}",
+            tensor.dtype()
+        );
+    }
+    if tensor.device().location() != device.location() {
+        candle::bail!("{op}: {name} must be on the same CUDA device as the input");
+    }
+    if !tensor.is_contiguous() {
+        candle::bail!("{op}: {name} must be contiguous");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn validate_scale(
+    scale: Option<&Tensor>,
+    name: &str,
+    op: &str,
+    device: &candle::Device,
+) -> Result<()> {
+    if let Some(scale) = scale {
+        validate_tensor(scale, name, op, 1, DType::F32, device)?;
+        if scale.elem_count() == 0 {
+            candle::bail!("{op}: {name} must not be empty");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
 fn scale_gpu_ptr(scale: Option<&Tensor>) -> Result<*const f32> {
     match scale {
         Some(t) => {
@@ -65,7 +117,9 @@ fn validate_native_flash_cache_head_dim(head_dim: usize, is_fp8: bool) -> Result
     } else if matches!(head_dim, 64 | 128 | 256 | 512) {
         Ok(())
     } else {
-        candle::bail!("flash_reshape_and_cache supports head_dim 64, 128, 256, or 512, got {head_dim}")
+        candle::bail!(
+            "flash_reshape_and_cache supports head_dim 64, 128, 256, or 512, got {head_dim}"
+        )
     }
 }
 
@@ -118,16 +172,74 @@ pub fn flash_reshape_and_cache(
     v_scale: Option<&Tensor>,
     slot_mapping: &Tensor,
 ) -> Result<()> {
+    const OP: &str = "flash_reshape_and_cache";
     let dev = match key.device() {
         candle::Device::Cuda(d) => d,
-        _ => candle::bail!("flash_reshape_and_cache requires CUDA tensors"),
+        _ => candle::bail!("{OP}: key must be a CUDA tensor"),
     };
     let stream = get_cuda_stream(dev);
 
     let (num_tokens, num_kv_heads, head_dim) = key.dims3()?;
+    validate_tensor(key, "key", OP, 3, DType::BF16, key.device())?;
+    validate_tensor(value, "value", OP, 3, DType::BF16, key.device())?;
+    if value.dims() != key.dims() {
+        candle::bail!(
+            "{OP}: value shape {:?} must match key shape {:?}",
+            value.dims(),
+            key.dims()
+        );
+    }
+    let cache_dtype = key_cache.dtype();
+    if !matches!(cache_dtype, DType::BF16 | DType::U8) {
+        candle::bail!("{OP}: cache dtype must be BF16 or U8, got {cache_dtype:?}");
+    }
+    validate_tensor(key_cache, "key_cache", OP, 4, cache_dtype, key.device())?;
+    validate_tensor(value_cache, "value_cache", OP, 4, cache_dtype, key.device())?;
+    if value_cache.dims() != key_cache.dims() {
+        candle::bail!(
+            "{OP}: value_cache shape {:?} must match key_cache shape {:?}",
+            value_cache.dims(),
+            key_cache.dims()
+        );
+    }
+    let cache_dims = key_cache.dims();
+    if cache_dims[0] == 0 {
+        candle::bail!("{OP}: cache block count must be non-zero");
+    }
+    if cache_dims[2] != num_kv_heads || cache_dims[3] != head_dim {
+        candle::bail!(
+            "{OP}: cache shape {:?} is incompatible with key shape {:?}",
+            cache_dims,
+            key.dims()
+        );
+    }
+    validate_tensor(
+        slot_mapping,
+        "slot_mapping",
+        OP,
+        1,
+        DType::I64,
+        key.device(),
+    )?;
+    if slot_mapping.elem_count() != num_tokens {
+        candle::bail!(
+            "{OP}: slot_mapping length {} must equal token count {num_tokens}",
+            slot_mapping.elem_count()
+        );
+    }
+    validate_scale(k_scale, "k_scale", OP, key.device())?;
+    validate_scale(v_scale, "v_scale", OP, key.device())?;
     let block_size = key_cache.dim(1)?;
+    if num_tokens == 0 || num_kv_heads == 0 || head_dim == 0 || block_size == 0 {
+        candle::bail!("{OP}: tensor dimensions must be non-zero");
+    }
     let is_fp8 = key_cache.dtype() == DType::U8;
     validate_native_flash_cache_head_dim(head_dim, is_fp8)?;
+
+    let num_tokens = checked_u32(num_tokens, "num_tokens", OP)?;
+    let num_kv_heads = checked_u32(num_kv_heads, "num_kv_heads", OP)?;
+    let head_dim = checked_u32(head_dim, "head_dim", OP)?;
+    let block_size = checked_u32(block_size, "block_size", OP)?;
 
     let key_ptr = ptr_from_tensor(key)?;
     let value_ptr = ptr_from_tensor(value)?;
@@ -144,6 +256,8 @@ pub fn flash_reshape_and_cache(
         *slice.slice(l.start_offset()..).device_ptr() as *const i64
     };
 
+    // SAFETY: Tensor structure is checked above. Slot values remain a trusted
+    // caller invariant and must address valid elements in the supplied caches.
     if is_fp8 {
         let ks_ptr = scale_gpu_ptr(k_scale)?;
         let vs_ptr = scale_gpu_ptr(v_scale)?;
@@ -154,10 +268,10 @@ pub fn flash_reshape_and_cache(
                 key_cache_ptr,
                 value_cache_ptr,
                 slot_ptr,
-                num_tokens as u32,
-                num_kv_heads as u32,
-                head_dim as u32,
-                block_size as u32,
+                num_tokens,
+                num_kv_heads,
+                head_dim,
+                block_size,
                 ks_ptr,
                 vs_ptr,
                 stream,
@@ -171,10 +285,10 @@ pub fn flash_reshape_and_cache(
                 key_cache_ptr,
                 value_cache_ptr,
                 slot_ptr,
-                num_tokens as u32,
-                num_kv_heads as u32,
-                head_dim as u32,
-                block_size as u32,
+                num_tokens,
+                num_kv_heads,
+                head_dim,
+                block_size,
                 stream,
             );
         }
@@ -239,15 +353,102 @@ pub fn flash_prefill_with_causal(
     max_seqlen_q: usize,
     causal: bool,
 ) -> Result<Tensor> {
+    const OP: &str = "flash_prefill";
     let dev = match query.device() {
         candle::Device::Cuda(d) => d,
-        _ => candle::bail!("flash_prefill requires CUDA"),
+        _ => candle::bail!("{OP}: query must be a CUDA tensor"),
     };
     let stream = get_cuda_stream(dev);
 
-    let q_len = query.dim(0)?;
-    let block_size = key_cache.dim(1)?;
+    validate_tensor(query, "query", OP, 3, DType::BF16, query.device())?;
+    let (q_len, query_heads, query_head_dim) = query.dims3()?;
+    if query_heads != num_q_heads || query_head_dim != head_dim {
+        candle::bail!(
+            "{OP}: query shape {:?} does not match num_q_heads={num_q_heads}, head_dim={head_dim}",
+            query.dims()
+        );
+    }
     let is_fp8 = key_cache.dtype() == DType::U8;
+    let cache_dtype = if is_fp8 { DType::U8 } else { DType::BF16 };
+    validate_tensor(key_cache, "key_cache", OP, 4, cache_dtype, query.device())?;
+    validate_tensor(
+        value_cache,
+        "value_cache",
+        OP,
+        4,
+        cache_dtype,
+        query.device(),
+    )?;
+    if value_cache.dims() != key_cache.dims() {
+        candle::bail!(
+            "{OP}: value_cache shape {:?} must match key_cache shape {:?}",
+            value_cache.dims(),
+            key_cache.dims()
+        );
+    }
+    let cache_dims = key_cache.dims();
+    if cache_dims[0] == 0 {
+        candle::bail!("{OP}: cache block count must be non-zero");
+    }
+    if cache_dims[2] != num_kv_heads || cache_dims[3] != head_dim {
+        candle::bail!(
+            "{OP}: cache shape {:?} does not match num_kv_heads={num_kv_heads}, head_dim={head_dim}",
+            cache_dims
+        );
+    }
+    let block_size = cache_dims[1];
+    validate_tensor(
+        block_table,
+        "block_table",
+        OP,
+        2,
+        DType::U32,
+        query.device(),
+    )?;
+    validate_tensor(
+        context_lens,
+        "context_lens",
+        OP,
+        1,
+        DType::U32,
+        query.device(),
+    )?;
+    let num_seqs = context_lens.elem_count();
+    if num_seqs == 0 {
+        candle::bail!("{OP}: context_lens must contain at least one sequence");
+    }
+    if block_table.dim(1)? == 0 {
+        candle::bail!("{OP}: block_table must contain at least one block per sequence");
+    }
+    if block_table.dim(0)? != num_seqs {
+        candle::bail!(
+            "{OP}: block_table sequence count {} must match context_lens length {num_seqs}",
+            block_table.dim(0)?
+        );
+    }
+    if let Some(cu) = cu_seqlens_q {
+        validate_tensor(cu, "cu_seqlens_q", OP, 1, DType::U32, query.device())?;
+        if cu.elem_count() != num_seqs + 1 {
+            candle::bail!(
+                "{OP}: cu_seqlens_q length {} must equal num_seqs + 1 ({})",
+                cu.elem_count(),
+                num_seqs + 1
+            );
+        }
+    } else if num_seqs != 1 {
+        candle::bail!("{OP}: cu_seqlens_q is required when num_seqs is not one");
+    }
+    validate_scale(k_scale, "k_scale", OP, query.device())?;
+    validate_scale(v_scale, "v_scale", OP, query.device())?;
+    if q_len == 0
+        || num_q_heads == 0
+        || num_kv_heads == 0
+        || head_dim == 0
+        || block_size == 0
+        || max_seqlen_q == 0
+    {
+        candle::bail!("{OP}: tensor dimensions and max_seqlen_q must be non-zero");
+    }
     if is_fp8 {
         validate_native_flash_head_dim(head_dim, "flash_prefill fp8")?;
     } else {
@@ -261,9 +462,9 @@ pub fn flash_prefill_with_causal(
     let vc_ptr = ptr_from_tensor(value_cache)?;
     let o_ptr = ptr_from_tensor(&o)? as *mut std::ffi::c_void;
 
-    let sw = sliding_window.unwrap_or(0) as u32;
+    let sw = checked_u32(sliding_window.unwrap_or(0), "sliding_window", OP)?;
 
-    let block_table_stride = block_table.dim(1)? as u32;
+    let block_table_stride = checked_u32(block_table.dim(1)?, "block_table_stride", OP)?;
     let bt_ptr = {
         let (s, l) = block_table.storage_and_layout();
         let s = match &*s {
@@ -273,23 +474,29 @@ pub fn flash_prefill_with_causal(
         *s.slice(l.start_offset()..).device_ptr() as *const c_int
     };
 
-    let (cu_ptr, cl_ptr, num_seqs, actual_max_q_len) = if let Some(cu) = cu_seqlens_q {
-        let ns = cu.dim(0)? - 1;
-        (
-            gpu_ptr_u32(cu)?,
-            gpu_ptr_u32(context_lens)?,
-            ns,
-            max_seqlen_q,
-        )
+    let owned_cu;
+    let (cu_ptr, cl_ptr, actual_max_q_len) = if let Some(cu) = cu_seqlens_q {
+        (gpu_ptr_u32(cu)?, gpu_ptr_u32(context_lens)?, max_seqlen_q)
     } else {
-        let cu_t = Tensor::from_vec(vec![0u32, q_len as u32], 2, query.device())?;
-        (
-            gpu_ptr_u32(&cu_t)?,
-            gpu_ptr_u32(context_lens)?,
-            1usize,
-            q_len,
-        )
+        owned_cu = Tensor::from_vec(
+            vec![0u32, checked_u32(q_len, "q_len", OP)?],
+            2,
+            query.device(),
+        )?;
+        (gpu_ptr_u32(&owned_cu)?, gpu_ptr_u32(context_lens)?, q_len)
     };
+
+    let num_seqs = checked_u32(num_seqs, "num_seqs", OP)?;
+    let actual_max_q_len = checked_u32(actual_max_q_len, "max_seqlen_q", OP)?;
+    let num_q_heads = checked_u32(num_q_heads, "num_q_heads", OP)?;
+    let num_kv_heads = checked_u32(num_kv_heads, "num_kv_heads", OP)?;
+    let head_dim = checked_u32(head_dim, "head_dim", OP)?;
+    let block_size = checked_u32(block_size, "block_size", OP)?;
+
+    // SAFETY: Tensor structure is checked above. Metadata values remain a trusted
+    // caller invariant: block indices and slots must address the caches, context
+    // lengths must fit their blocks, and cu_seqlens_q must be monotonic, start at
+    // zero, end at q_len, and agree with max_seqlen_q.
 
     if is_fp8 {
         let ks_ptr = scale_gpu_ptr(k_scale)?;
@@ -305,12 +512,12 @@ pub fn flash_prefill_with_causal(
                 block_table_stride,
                 cu_ptr,
                 cl_ptr,
-                num_seqs as u32,
-                actual_max_q_len as u32,
-                num_q_heads as u32,
-                num_kv_heads as u32,
-                head_dim as u32,
-                block_size as u32,
+                num_seqs,
+                actual_max_q_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                block_size,
                 sw,
                 causal as u32,
                 scale,
@@ -332,12 +539,12 @@ pub fn flash_prefill_with_causal(
                 block_table_stride,
                 cu_ptr,
                 cl_ptr,
-                num_seqs as u32,
-                actual_max_q_len as u32,
-                num_q_heads as u32,
-                num_kv_heads as u32,
-                head_dim as u32,
-                block_size as u32,
+                num_seqs,
+                actual_max_q_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                block_size,
                 sw,
                 causal as u32,
                 scale,
@@ -895,11 +1102,7 @@ pub fn flash_tq4_decode(
     let num_seqs = query.dim(0)?;
     let block_size_from_absmax = {
         let dims = k_absmax.dims();
-        if dims.len() >= 2 {
-            dims[1]
-        } else {
-            16
-        }
+        if dims.len() >= 2 { dims[1] } else { 16 }
     };
     let q_stride = (num_q_heads * head_dim) as u32;
 
@@ -1082,11 +1285,7 @@ pub fn flash_tq3_decode(
     let num_seqs = query.dim(0)?;
     let block_size_from_absmax = {
         let dims = k_absmax.dims();
-        if dims.len() >= 2 {
-            dims[1]
-        } else {
-            16
-        }
+        if dims.len() >= 2 { dims[1] } else { 16 }
     };
     let q_stride = (num_q_heads * head_dim) as u32;
 
@@ -1234,6 +1433,7 @@ pub fn flash_tq4_prefill(
         *s.slice(l.start_offset()..).device_ptr() as *const c_int
     };
 
+    let owned_cu;
     let (cu_ptr, cl_ptr, num_seqs, actual_max_q_len) = if let Some(cu) = cu_seqlens_q {
         let ns = cu.dim(0)? - 1;
         (
@@ -1243,9 +1443,9 @@ pub fn flash_tq4_prefill(
             max_seqlen_q,
         )
     } else {
-        let cu_t = Tensor::from_vec(vec![0u32, q_len as u32], 2, query.device())?;
+        owned_cu = Tensor::from_vec(vec![0u32, q_len as u32], 2, query.device())?;
         (
-            gpu_ptr_u32(&cu_t)?,
+            gpu_ptr_u32(&owned_cu)?,
             gpu_ptr_u32(context_lens)?,
             1usize,
             q_len,
