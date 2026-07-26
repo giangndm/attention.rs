@@ -143,6 +143,15 @@ __device__ __forceinline__ uint2 load_uint2_safe(const uint8_t *ptr) {
 #endif
 }
 
+// Scale rows are byte-packed and may start at an odd address when K/16 is odd.
+// memcpy preserves the public K%16 contract without undefined/misaligned loads;
+// NVCC folds aligned cases into a native 16-bit global load.
+__device__ __forceinline__ uint16_t load_uint16_safe(const uint8_t *ptr) {
+  uint16_t value;
+  memcpy(&value, ptr, sizeof(value));
+  return value;
+}
+
 #ifdef NVFP4_HW_DEQUANT
 // --- Blackwell hardware path (SM100+) ---
 // Converts 8 packed FP4 values (one uint32 = 8 nibbles) to 8 floats using
@@ -211,7 +220,11 @@ __device__ __forceinline__ float hw_dot_16(uint2 packed, float scale,
 //
 // On SM100+ (Blackwell): uses hw_dot_16 with __nv_cvt_fp4x2_to_halfraw2
 // intrinsics for hardware FP4 dequantization — eliminates LUT tables entirely.
+#ifdef NVFP4_HW_DEQUANT
+constexpr int BLOCK_N_SM = 16;
+#else
 constexpr int BLOCK_N_SM = 8;
+#endif
 
 template <typename T>
 __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
@@ -293,23 +306,26 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
 #ifdef NVFP4_HW_DEQUANT
     if (!force_lut) {
       // --- Blackwell hardware path: fused dequant + dot product ---
-      {
+      int k2 = k + NVFP4_BLOCK_SIZE;
+      if (k2 < K) {
+        const uint16_t raw_scales = load_uint16_safe(
+            w_scale_row + k / NVFP4_BLOCK_SIZE);
+        const float2 block_scales = fp8x2_scale_to_float2(raw_scales);
+        const uint2 w_vec =
+            __ldg(reinterpret_cast<const uint2 *>(w_row + k / 2));
+        const uint2 w_vec2 =
+            __ldg(reinterpret_cast<const uint2 *>(w_row + k2 / 2));
+        acc += hw_dot_16(w_vec, block_scales.x * weight_global_scale,
+                         s_input + (k + (k / WARP_SIZE)));
+        acc += hw_dot_16(w_vec2, block_scales.y * weight_global_scale,
+                         s_input + (k2 + (k2 / WARP_SIZE)));
+      } else {
         float block_scale =
             fp8_scale_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
             weight_global_scale;
         uint2 w_vec = __ldg(reinterpret_cast<const uint2 *>(w_row + k / 2));
         const float *in = s_input + (k + (k / WARP_SIZE));
         acc += hw_dot_16(w_vec, block_scale, in);
-      }
-
-      int k2 = k + NVFP4_BLOCK_SIZE;
-      if (k2 < K) {
-        float block_scale2 =
-            fp8_scale_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
-            weight_global_scale;
-        uint2 w_vec2 = __ldg(reinterpret_cast<const uint2 *>(w_row + k2 / 2));
-        const float *in2 = s_input + (k2 + (k2 / WARP_SIZE));
-        acc += hw_dot_16(w_vec2, block_scale2, in2);
       }
     } else
 #endif
