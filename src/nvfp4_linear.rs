@@ -22,6 +22,14 @@ enum DecodeKernel {
     HardwareFp4,
 }
 
+/// Optional grouped-row specialization selected before the unchanged per-row route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroupedDecodeKernel {
+    Full,
+    Tiled,
+    Fallback(DecodeKernel),
+}
+
 /// Dynamic shared memory requested by the small-M CUDA kernel.
 ///
 /// The kernel stores `K` dequantized values with one padding slot per warp-sized
@@ -39,6 +47,24 @@ fn smallm_shared_memory_bytes(k: usize) -> Result<usize> {
 /// Dynamic shared memory requested by the fixed-K tiled small-M kernel.
 fn smallm_tiled_shared_memory_bytes(k: usize) -> Result<usize> {
     smallm_shared_memory_bytes(k.min(SMALLM_TILE_K))
+}
+
+/// Dynamic shared memory for separately padded grouped input rows.
+fn grouped_smallm_shared_memory_bytes(rows: usize, k: usize) -> Result<usize> {
+    smallm_shared_memory_bytes(k)?
+        .checked_mul(rows)
+        .ok_or_else(|| {
+            candle_core::Error::Msg("grouped small-M shared-memory size overflow".into())
+        })
+}
+
+/// Dynamic shared memory for separately padded fixed-K grouped input tiles.
+fn grouped_smallm_tiled_shared_memory_bytes(rows: usize, k: usize) -> Result<usize> {
+    smallm_tiled_shared_memory_bytes(k)?
+        .checked_mul(rows)
+        .ok_or_else(|| {
+            candle_core::Error::Msg("grouped tiled small-M shared-memory size overflow".into())
+        })
 }
 
 /// Select a safe decode kernel from dimensions and device capabilities only.
@@ -70,6 +96,30 @@ fn select_decode_kernel(
     )
 }
 
+/// Select a grouped-row specialization or fall back to the existing per-row policy.
+fn select_grouped_decode_kernel(
+    rows: usize,
+    k: usize,
+    n: usize,
+    max_shared_memory_bytes: usize,
+    hardware_fp4_available: bool,
+) -> Result<GroupedDecodeKernel> {
+    if !matches!(rows, 2 | 3) {
+        candle_core::bail!("grouped NVFP4 decode supports exactly 2 or 3 rows, got {rows}")
+    }
+
+    if grouped_smallm_shared_memory_bytes(rows, k)? <= max_shared_memory_bytes {
+        return Ok(GroupedDecodeKernel::Full);
+    }
+
+    if grouped_smallm_tiled_shared_memory_bytes(rows, k)? <= max_shared_memory_bytes {
+        return Ok(GroupedDecodeKernel::Tiled);
+    }
+
+    select_decode_kernel(k, n, max_shared_memory_bytes, hardware_fp4_available)
+        .map(GroupedDecodeKernel::Fallback)
+}
+
 /// Converts the CUDA wrapper's immediate launch status into a Candle error.
 fn cuda_launch_status(status: i32, kernel: &str) -> Result<()> {
     if status == 0 {
@@ -77,6 +127,164 @@ fn cuda_launch_status(status: i32, kernel: &str) -> Result<()> {
     } else {
         candle_core::bail!("{kernel} launch failed with CUDA error {status}")
     }
+}
+
+/// Convert a tensor dimension at the grouped FFI boundary without truncation.
+fn cuda_dimension(value: usize, name: &str) -> Result<i32> {
+    i32::try_from(value).map_err(|_| {
+        candle_core::Error::Msg(format!(
+            "NVFP4 grouped small-M {name}={value} exceeds CUDA i32 range"
+        ))
+    })
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_grouped_smallm(
+    kernel: GroupedDecodeKernel,
+    dtype: DType,
+    input: *const std::ffi::c_void,
+    weight: *const u8,
+    scale: *const u8,
+    weight_global_scale: f32,
+    bias: *const std::ffi::c_void,
+    output: *mut std::ffi::c_void,
+    m: usize,
+    n: usize,
+    k: usize,
+    has_bias: bool,
+    force_lut: bool,
+    stream: i64,
+) -> Result<i32> {
+    let m = cuda_dimension(m, "M")?;
+    let n = cuda_dimension(n, "N")?;
+    let k = cuda_dimension(k, "K")?;
+    let status = match (kernel, m, dtype) {
+        (GroupedDecodeKernel::Full, 2, DType::F16) => ffi::nvfp4_matmul_smallm_rows2_f16(
+            input,
+            weight,
+            scale,
+            weight_global_scale,
+            bias,
+            output,
+            m,
+            n,
+            k,
+            has_bias,
+            force_lut,
+            stream,
+        ),
+        (GroupedDecodeKernel::Full, 2, DType::BF16) => ffi::nvfp4_matmul_smallm_rows2_bf16(
+            input,
+            weight,
+            scale,
+            weight_global_scale,
+            bias,
+            output,
+            m,
+            n,
+            k,
+            has_bias,
+            force_lut,
+            stream,
+        ),
+        (GroupedDecodeKernel::Full, 3, DType::F16) => ffi::nvfp4_matmul_smallm_rows3_f16(
+            input,
+            weight,
+            scale,
+            weight_global_scale,
+            bias,
+            output,
+            m,
+            n,
+            k,
+            has_bias,
+            force_lut,
+            stream,
+        ),
+        (GroupedDecodeKernel::Full, 3, DType::BF16) => ffi::nvfp4_matmul_smallm_rows3_bf16(
+            input,
+            weight,
+            scale,
+            weight_global_scale,
+            bias,
+            output,
+            m,
+            n,
+            k,
+            has_bias,
+            force_lut,
+            stream,
+        ),
+        (GroupedDecodeKernel::Tiled, 2, DType::F16) => {
+            ffi::nvfp4_matmul_smallm_tiled_rows2_f16(
+                input,
+                weight,
+                scale,
+                weight_global_scale,
+                bias,
+                output,
+                m,
+                n,
+                k,
+                has_bias,
+                force_lut,
+                stream,
+            )
+        }
+        (GroupedDecodeKernel::Tiled, 2, DType::BF16) => {
+            ffi::nvfp4_matmul_smallm_tiled_rows2_bf16(
+                input,
+                weight,
+                scale,
+                weight_global_scale,
+                bias,
+                output,
+                m,
+                n,
+                k,
+                has_bias,
+                force_lut,
+                stream,
+            )
+        }
+        (GroupedDecodeKernel::Tiled, 3, DType::F16) => {
+            ffi::nvfp4_matmul_smallm_tiled_rows3_f16(
+                input,
+                weight,
+                scale,
+                weight_global_scale,
+                bias,
+                output,
+                m,
+                n,
+                k,
+                has_bias,
+                force_lut,
+                stream,
+            )
+        }
+        (GroupedDecodeKernel::Tiled, 3, DType::BF16) => {
+            ffi::nvfp4_matmul_smallm_tiled_rows3_bf16(
+                input,
+                weight,
+                scale,
+                weight_global_scale,
+                bias,
+                output,
+                m,
+                n,
+                k,
+                has_bias,
+                force_lut,
+                stream,
+            )
+        }
+        _ => candle_core::bail!(
+            "NVFP4 grouped small-M has no compiled route for M={m}, dtype={dtype:?}, kernel={kernel:?}"
+        ),
+    };
+    Ok(status)
 }
 
 #[cfg(feature = "cuda")]
@@ -398,6 +606,17 @@ pub fn nvfp4_matmul(
             } else {
                 None
             };
+            let grouped_decode_kernel = if !is_prefill && matches!(m, 2 | 3) {
+                Some(select_grouped_decode_kernel(
+                    m,
+                    k,
+                    n,
+                    max_optin_shared_memory_bytes(cuda_dev)?,
+                    hardware_fp4_available,
+                )?)
+            } else {
+                None
+            };
 
             let use_hardware_fp4 = !use_flashinfer_fp4
                 && hardware_fp4_available
@@ -657,6 +876,40 @@ pub fn nvfp4_matmul(
                 let force_lut = crate::nvfp4_force_lut();
 
                 unsafe {
+                    if let Some(grouped_kernel) = match grouped_decode_kernel {
+                        Some(GroupedDecodeKernel::Full) => Some(GroupedDecodeKernel::Full),
+                        Some(GroupedDecodeKernel::Tiled) => Some(GroupedDecodeKernel::Tiled),
+                        Some(GroupedDecodeKernel::Fallback(_)) | None => None,
+                    } {
+                        let status = launch_grouped_smallm(
+                            grouped_kernel,
+                            dtype,
+                            input_ptr,
+                            weight_ptr,
+                            scale_ptr,
+                            weight_global_scale,
+                            bias_ptr,
+                            output_ptr,
+                            m,
+                            n,
+                            k,
+                            has_bias,
+                            force_lut,
+                            stream,
+                        )?;
+                        let kernel_name = match grouped_kernel {
+                            GroupedDecodeKernel::Full => "NVFP4 grouped small-M",
+                            GroupedDecodeKernel::Tiled => "NVFP4 grouped tiled small-M",
+                            GroupedDecodeKernel::Fallback(_) => unreachable!(),
+                        };
+                        cuda_launch_status(status, kernel_name)?;
+                        drop(output_s);
+                        drop(scale_s);
+                        drop(weight_s);
+                        drop(input_s);
+                        return Ok(output);
+                    }
+
                     if m < 32 {
                         let status = match (decode_kernel, dtype) {
                             (Some(DecodeKernel::SmallMTiled), DType::F16) => {
@@ -956,8 +1209,10 @@ pub fn mlx_repack_u32_to_u8(weight_u32: &Tensor) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cuda_launch_status, select_decode_kernel, smallm_shared_memory_bytes,
-        smallm_tiled_shared_memory_bytes, DecodeKernel, NVFP4_BLOCK_SIZE, SMALLM_TILE_K,
+        cuda_dimension, cuda_launch_status, grouped_smallm_shared_memory_bytes,
+        grouped_smallm_tiled_shared_memory_bytes, select_decode_kernel,
+        select_grouped_decode_kernel, smallm_shared_memory_bytes, smallm_tiled_shared_memory_bytes,
+        DecodeKernel, GroupedDecodeKernel, NVFP4_BLOCK_SIZE, SMALLM_TILE_K,
     };
     #[cfg(feature = "cuda")]
     use candle_core::cuda_backend::cudarc::driver::DevicePtr;
@@ -1040,6 +1295,93 @@ mod tests {
 
         assert!(err.to_string().contains("small-M BF16"));
         assert!(err.to_string().contains("CUDA error 9"));
+    }
+
+    #[test]
+    fn m1_policy_remains_unchanged() {
+        assert_eq!(
+            select_decode_kernel(5_120, 5_121, RTX_5090_MAX_OPTIN_SHARED_MEMORY, false).unwrap(),
+            DecodeKernel::SmallM
+        );
+        assert_eq!(
+            select_decode_kernel(25_600, 5_121, RTX_5090_MAX_OPTIN_SHARED_MEMORY, false).unwrap(),
+            DecodeKernel::SmallMTiled
+        );
+        assert!(select_grouped_decode_kernel(1, 5_120, 17, 101_376, false).is_err());
+        assert!(select_grouped_decode_kernel(4, 5_120, 17, 101_376, false).is_err());
+    }
+
+    #[test]
+    fn grouped_m2_and_m3_select_full_when_row_bytes_fit() {
+        assert_eq!(
+            grouped_smallm_shared_memory_bytes(2, 5_120).unwrap(),
+            42_240
+        );
+        assert_eq!(
+            grouped_smallm_shared_memory_bytes(3, 5_120).unwrap(),
+            63_360
+        );
+        assert_eq!(
+            select_grouped_decode_kernel(2, 5_120, 17, 42_240, false).unwrap(),
+            GroupedDecodeKernel::Full
+        );
+        assert_eq!(
+            select_grouped_decode_kernel(3, 5_120, 17, 63_360, false).unwrap(),
+            GroupedDecodeKernel::Full
+        );
+    }
+
+    #[test]
+    fn grouped_m2_and_m3_select_tiled_when_only_tile_fits() {
+        assert_eq!(
+            grouped_smallm_tiled_shared_memory_bytes(2, 25_600).unwrap(),
+            67_584
+        );
+        assert_eq!(
+            grouped_smallm_tiled_shared_memory_bytes(3, 25_600).unwrap(),
+            101_376
+        );
+        assert_eq!(
+            select_grouped_decode_kernel(2, 25_600, 17, 67_584, false).unwrap(),
+            GroupedDecodeKernel::Tiled
+        );
+        assert_eq!(
+            select_grouped_decode_kernel(3, 25_600, 17, 101_376, false).unwrap(),
+            GroupedDecodeKernel::Tiled
+        );
+    }
+
+    #[test]
+    fn grouped_full_accepts_exact_shared_memory_limit() {
+        assert_eq!(
+            select_grouped_decode_kernel(3, 8_192, 17, 101_376, false).unwrap(),
+            GroupedDecodeKernel::Full
+        );
+    }
+
+    #[test]
+    fn grouped_shared_memory_rejects_row_multiplication_overflow() {
+        assert!(grouped_smallm_shared_memory_bytes(3, usize::MAX / 8).is_err());
+        assert!(grouped_smallm_tiled_shared_memory_bytes(usize::MAX, 8_192).is_err());
+    }
+
+    #[test]
+    fn grouped_policy_falls_back_to_existing_single_row_policy() {
+        assert_eq!(
+            select_grouped_decode_kernel(3, 5_120, 17, 21_120, false).unwrap(),
+            GroupedDecodeKernel::Fallback(DecodeKernel::SmallM)
+        );
+        assert_eq!(
+            select_grouped_decode_kernel(3, 25_600, 5_120, 33_791, true).unwrap(),
+            GroupedDecodeKernel::Fallback(DecodeKernel::HardwareFp4)
+        );
+        assert!(select_grouped_decode_kernel(3, 25_600, 5_121, 33_791, false).is_err());
+    }
+
+    #[test]
+    fn grouped_cuda_dimensions_are_checked() {
+        assert_eq!(cuda_dimension(i32::MAX as usize, "K").unwrap(), i32::MAX);
+        assert!(cuda_dimension(i32::MAX as usize + 1, "K").is_err());
     }
 
     #[cfg(feature = "cuda")]
@@ -1138,6 +1480,270 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn assert_grouped_matches_single_row(
+        dev: &Device,
+        m: usize,
+        rows: usize,
+        k: usize,
+        tiled: bool,
+        has_bias: bool,
+        dtype: DType,
+        force_lut: bool,
+    ) -> candle_core::Result<()> {
+        const N: usize = 17;
+
+        let input_values = (0..m * k)
+            .map(|i| ((i % 31) as f32 - 15.0) / 64.0)
+            .collect::<Vec<_>>();
+        let weight_values = (0..N * (k / 2))
+            .map(|i| i.wrapping_mul(37).wrapping_add(11) as u8)
+            .collect::<Vec<_>>();
+        let scale_values = (0..N * (k / NVFP4_BLOCK_SIZE))
+            .map(|i| if i % 2 == 0 { 0x20_u8 } else { 0x28_u8 })
+            .collect::<Vec<_>>();
+        let bias_values = (0..N).map(|i| (i as f32 - 8.0) / 16.0).collect::<Vec<_>>();
+
+        let input = Tensor::from_vec(input_values, (m, k), dev)?.to_dtype(dtype)?;
+        let weight = Tensor::from_vec(weight_values, (N, k / 2), dev)?;
+        let scale = Tensor::from_vec(scale_values, (N, k / NVFP4_BLOCK_SIZE), dev)?;
+        let bias = Tensor::from_vec(bias_values, (N,), dev)?.to_dtype(dtype)?;
+        let reference = Tensor::zeros((m, N), dtype, dev)?;
+        let grouped = Tensor::zeros((m, N), dtype, dev)?;
+
+        let input_ptr = cuda_ptr(&input)? as *const std::ffi::c_void;
+        let weight_ptr = cuda_ptr(&weight)? as *const u8;
+        let scale_ptr = cuda_ptr(&scale)? as *const u8;
+        let bias_ptr = if has_bias {
+            cuda_ptr(&bias)? as *const std::ffi::c_void
+        } else {
+            std::ptr::null()
+        };
+        let reference_ptr = cuda_ptr(&reference)? as *mut std::ffi::c_void;
+        let grouped_ptr = cuda_ptr(&grouped)? as *mut std::ffi::c_void;
+        let stream = *dev.as_cuda_device()?.cu_stream() as i64;
+
+        let (reference_status, grouped_status) = unsafe {
+            let reference_status = match (tiled, dtype) {
+                (false, DType::F16) => crate::kernels::ffi::nvfp4_matmul_smallm_f16(
+                    input_ptr,
+                    weight_ptr,
+                    scale_ptr,
+                    0.25,
+                    bias_ptr,
+                    reference_ptr,
+                    m as i32,
+                    N as i32,
+                    k as i32,
+                    has_bias,
+                    force_lut,
+                    stream,
+                ),
+                (false, DType::BF16) => crate::kernels::ffi::nvfp4_matmul_smallm_bf16(
+                    input_ptr,
+                    weight_ptr,
+                    scale_ptr,
+                    0.25,
+                    bias_ptr,
+                    reference_ptr,
+                    m as i32,
+                    N as i32,
+                    k as i32,
+                    has_bias,
+                    force_lut,
+                    stream,
+                ),
+                (true, DType::F16) => crate::kernels::ffi::nvfp4_matmul_smallm_tiled_f16(
+                    input_ptr,
+                    weight_ptr,
+                    scale_ptr,
+                    0.25,
+                    bias_ptr,
+                    reference_ptr,
+                    m as i32,
+                    N as i32,
+                    k as i32,
+                    has_bias,
+                    force_lut,
+                    stream,
+                ),
+                (true, DType::BF16) => crate::kernels::ffi::nvfp4_matmul_smallm_tiled_bf16(
+                    input_ptr,
+                    weight_ptr,
+                    scale_ptr,
+                    0.25,
+                    bias_ptr,
+                    reference_ptr,
+                    m as i32,
+                    N as i32,
+                    k as i32,
+                    has_bias,
+                    force_lut,
+                    stream,
+                ),
+                _ => unreachable!("fixture only covers F16 and BF16"),
+            };
+
+            let grouped_status = match (rows, tiled, dtype) {
+                (2, false, DType::F16) => crate::kernels::ffi::nvfp4_matmul_smallm_rows2_f16(
+                    input_ptr,
+                    weight_ptr,
+                    scale_ptr,
+                    0.25,
+                    bias_ptr,
+                    grouped_ptr,
+                    m as i32,
+                    N as i32,
+                    k as i32,
+                    has_bias,
+                    force_lut,
+                    stream,
+                ),
+                (2, false, DType::BF16) => crate::kernels::ffi::nvfp4_matmul_smallm_rows2_bf16(
+                    input_ptr,
+                    weight_ptr,
+                    scale_ptr,
+                    0.25,
+                    bias_ptr,
+                    grouped_ptr,
+                    m as i32,
+                    N as i32,
+                    k as i32,
+                    has_bias,
+                    force_lut,
+                    stream,
+                ),
+                (3, false, DType::F16) => crate::kernels::ffi::nvfp4_matmul_smallm_rows3_f16(
+                    input_ptr,
+                    weight_ptr,
+                    scale_ptr,
+                    0.25,
+                    bias_ptr,
+                    grouped_ptr,
+                    m as i32,
+                    N as i32,
+                    k as i32,
+                    has_bias,
+                    force_lut,
+                    stream,
+                ),
+                (3, false, DType::BF16) => crate::kernels::ffi::nvfp4_matmul_smallm_rows3_bf16(
+                    input_ptr,
+                    weight_ptr,
+                    scale_ptr,
+                    0.25,
+                    bias_ptr,
+                    grouped_ptr,
+                    m as i32,
+                    N as i32,
+                    k as i32,
+                    has_bias,
+                    force_lut,
+                    stream,
+                ),
+                (2, true, DType::F16) => crate::kernels::ffi::nvfp4_matmul_smallm_tiled_rows2_f16(
+                    input_ptr,
+                    weight_ptr,
+                    scale_ptr,
+                    0.25,
+                    bias_ptr,
+                    grouped_ptr,
+                    m as i32,
+                    N as i32,
+                    k as i32,
+                    has_bias,
+                    force_lut,
+                    stream,
+                ),
+                (2, true, DType::BF16) => {
+                    crate::kernels::ffi::nvfp4_matmul_smallm_tiled_rows2_bf16(
+                        input_ptr,
+                        weight_ptr,
+                        scale_ptr,
+                        0.25,
+                        bias_ptr,
+                        grouped_ptr,
+                        m as i32,
+                        N as i32,
+                        k as i32,
+                        has_bias,
+                        force_lut,
+                        stream,
+                    )
+                }
+                (3, true, DType::F16) => crate::kernels::ffi::nvfp4_matmul_smallm_tiled_rows3_f16(
+                    input_ptr,
+                    weight_ptr,
+                    scale_ptr,
+                    0.25,
+                    bias_ptr,
+                    grouped_ptr,
+                    m as i32,
+                    N as i32,
+                    k as i32,
+                    has_bias,
+                    force_lut,
+                    stream,
+                ),
+                (3, true, DType::BF16) => {
+                    crate::kernels::ffi::nvfp4_matmul_smallm_tiled_rows3_bf16(
+                        input_ptr,
+                        weight_ptr,
+                        scale_ptr,
+                        0.25,
+                        bias_ptr,
+                        grouped_ptr,
+                        m as i32,
+                        N as i32,
+                        k as i32,
+                        has_bias,
+                        force_lut,
+                        stream,
+                    )
+                }
+                _ => unreachable!("fixture only covers ROWS=2/3 and F16/BF16"),
+            };
+            (reference_status, grouped_status)
+        };
+
+        cuda_launch_status(reference_status, "NVFP4 single-row reference")?;
+        cuda_launch_status(grouped_status, "NVFP4 grouped-row candidate")?;
+        assert_eq!(
+            reference.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+            grouped.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+            "M={m}, ROWS={rows}, K={k}, tiled={tiled}, bias={has_bias}, dtype={dtype:?}, force_lut={force_lut}"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn grouped_smallm_matches_single_row_kernels_on_gpu1() -> candle_core::Result<()> {
+        let dev = match Device::new_cuda(1) {
+            Ok(dev) => dev,
+            Err(_) => return Ok(()),
+        };
+        for dtype in [DType::F16, DType::BF16] {
+            for force_lut in [false, true] {
+                assert_grouped_matches_single_row(
+                    &dev, 2, 2, 5_120, false, true, dtype, force_lut,
+                )?;
+                assert_grouped_matches_single_row(
+                    &dev, 2, 2, 17_424, true, false, dtype, force_lut,
+                )?;
+                assert_grouped_matches_single_row(
+                    &dev, 3, 3, 5_120, false, false, dtype, force_lut,
+                )?;
+                assert_grouped_matches_single_row(
+                    &dev, 3, 3, 17_424, true, true, dtype, force_lut,
+                )?;
+            }
+        }
+        assert_grouped_matches_single_row(&dev, 2, 3, 5_120, false, false, DType::BF16, true)?;
         Ok(())
     }
 }

@@ -627,6 +627,274 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
   }
 }
 
+template <int ROWS>
+__device__ __forceinline__ void grouped_lut_dot_16(
+    uint2 packed, float scale, const float *s_input, int shared_row_stride,
+    int local_k, int active_rows, float (&acc)[ROWS], uint32_t LUT0,
+    uint32_t LUT1, uint32_t LUT2, uint32_t LUT3) {
+  const int2 w0 = get_int_from_table_16(packed.x, LUT0, LUT1, LUT2, LUT3);
+  const int2 w1 = get_int_from_table_16(packed.y, LUT0, LUT1, LUT2, LUT3);
+#pragma unroll
+  for (int row = 0; row < ROWS; ++row) {
+    if (row >= active_rows)
+      continue;
+    const float *in = s_input + row * shared_row_stride + local_k +
+                      local_k / WARP_SIZE;
+    float partial = 0.0f;
+    partial = fmaf(in[0], (float)(int8_t)(w0.x), partial);
+    partial = fmaf(in[1], (float)(int8_t)(w0.y), partial);
+    partial = fmaf(in[2], (float)(int8_t)(w0.x >> 8), partial);
+    partial = fmaf(in[3], (float)(int8_t)(w0.y >> 8), partial);
+    partial = fmaf(in[4], (float)(int8_t)(w0.x >> 16), partial);
+    partial = fmaf(in[5], (float)(int8_t)(w0.y >> 16), partial);
+    partial = fmaf(in[6], (float)(int8_t)(w0.x >> 24), partial);
+    partial = fmaf(in[7], (float)(int8_t)(w0.y >> 24), partial);
+    partial = fmaf(in[8], (float)(int8_t)(w1.x), partial);
+    partial = fmaf(in[9], (float)(int8_t)(w1.y), partial);
+    partial = fmaf(in[10], (float)(int8_t)(w1.x >> 8), partial);
+    partial = fmaf(in[11], (float)(int8_t)(w1.y >> 8), partial);
+    partial = fmaf(in[12], (float)(int8_t)(w1.x >> 16), partial);
+    partial = fmaf(in[13], (float)(int8_t)(w1.y >> 16), partial);
+    partial = fmaf(in[14], (float)(int8_t)(w1.x >> 24), partial);
+    partial = fmaf(in[15], (float)(int8_t)(w1.y >> 24), partial);
+    acc[row] = fmaf(partial, scale, acc[row]);
+  }
+}
+
+#ifdef NVFP4_HW_DEQUANT
+template <int ROWS>
+__device__ __forceinline__ void grouped_hw_dot_16(
+    uint2 packed, float scale, const float *s_input, int shared_row_stride,
+    int local_k, int active_rows, float (&acc)[ROWS]) {
+  float partial[ROWS];
+#pragma unroll
+  for (int row = 0; row < ROWS; ++row)
+    partial[row] = 0.0f;
+
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const uint8_t byte = (packed.x >> (i * 8)) & 0xFF;
+    const __half2_raw h2 = __nv_cvt_fp4x2_to_halfraw2(
+        static_cast<__nv_fp4x2_storage_t>(byte), __NV_E2M1);
+    const float2 values =
+        __half22float2(*reinterpret_cast<const __half2 *>(&h2));
+#pragma unroll
+    for (int row = 0; row < ROWS; ++row) {
+      if (row >= active_rows)
+        continue;
+      const float *in = s_input + row * shared_row_stride + local_k +
+                        local_k / WARP_SIZE;
+      partial[row] = fmaf(in[i * 2], values.x, partial[row]);
+      partial[row] = fmaf(in[i * 2 + 1], values.y, partial[row]);
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const uint8_t byte = (packed.y >> (i * 8)) & 0xFF;
+    const __half2_raw h2 = __nv_cvt_fp4x2_to_halfraw2(
+        static_cast<__nv_fp4x2_storage_t>(byte), __NV_E2M1);
+    const float2 values =
+        __half22float2(*reinterpret_cast<const __half2 *>(&h2));
+#pragma unroll
+    for (int row = 0; row < ROWS; ++row) {
+      if (row >= active_rows)
+        continue;
+      const float *in = s_input + row * shared_row_stride + local_k +
+                        local_k / WARP_SIZE;
+      partial[row] = fmaf(in[8 + i * 2], values.x, partial[row]);
+      partial[row] = fmaf(in[8 + i * 2 + 1], values.y, partial[row]);
+    }
+  }
+#pragma unroll
+  for (int row = 0; row < ROWS; ++row) {
+    if (row < active_rows)
+      acc[row] += partial[row] * scale;
+  }
+}
+#endif
+
+// Reuses each packed weight and scale across exactly ROWS decode rows. TILED
+// selects either one full-input load or fixed-8192 streaming without changing
+// the existing single-row kernels or symbols.
+template <typename T, int ROWS, bool TILED>
+__launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
+    void nvfp4_matmul_smallm_grouped_kernel(
+        const T *__restrict__ input, const uint8_t *__restrict__ weight,
+        const uint8_t *__restrict__ weight_scale, float weight_global_scale,
+        const T *__restrict__ bias, T *__restrict__ output, int M, int N, int K,
+        bool has_bias, bool force_lut) {
+  extern __shared__ float s_input[];
+
+  const uint32_t LUT0 = 0x03020100;
+  const uint32_t LUT1 = 0x0C080604;
+  const uint32_t LUT2 = 0xFDFEFF00;
+  const uint32_t LUT3 = 0xF4F8FAFC;
+
+  const int tid = threadIdx.x;
+  const int block_size = blockDim.x;
+  const int warp_id = tid / WARP_SIZE;
+  const int lane_id = tid % WARP_SIZE;
+  const int row_base = blockIdx.y * ROWS;
+  const int active_rows = min(ROWS, M - row_base);
+  const int n_idx = blockIdx.x * BLOCK_N_SM + warp_id;
+  const bool active_output = n_idx < N;
+  const int weight_row_stride = K / 2;
+  const int scale_stride = CEILDIV(K, NVFP4_BLOCK_SIZE);
+  const int shared_k = TILED ? min(K, SMALLM_TILE_K) : K;
+  const int shared_row_stride = shared_k + CEILDIV(shared_k, WARP_SIZE);
+  const int tile_step = TILED ? SMALLM_TILE_K : (K > 0 ? K : 1);
+
+  const uint8_t *w_row =
+      active_output ? weight + (size_t)n_idx * weight_row_stride : nullptr;
+  const uint8_t *w_scale_row =
+      active_output ? weight_scale + (size_t)n_idx * scale_stride : nullptr;
+  float acc[ROWS];
+#pragma unroll
+  for (int row = 0; row < ROWS; ++row)
+    acc[row] = 0.0f;
+
+  constexpr int ELEMS_PER_VEC = 8;
+  constexpr int ELEMS_PER_LANE = 2 * NVFP4_BLOCK_SIZE;
+  for (int tile_base = 0; tile_base < K; tile_base += tile_step) {
+    const int tile_k = TILED ? min(SMALLM_TILE_K, K - tile_base) : K;
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+    for (int idx = tid; idx < active_rows * tile_k; idx += block_size) {
+      const int row = idx / tile_k;
+      const int local_k = idx % tile_k;
+      const T *in_row = input + (size_t)(row_base + row) * K + tile_base;
+      const int smem_idx = row * shared_row_stride + local_k +
+                           local_k / WARP_SIZE;
+      if constexpr (std::is_same_v<T, half>) {
+        s_input[smem_idx] = __half2float(__ldg(&in_row[local_k]));
+      } else {
+        s_input[smem_idx] = __bfloat162float(__ldg(&in_row[local_k]));
+      }
+    }
+#else
+    const int tile_vecs = tile_k / ELEMS_PER_VEC;
+    for (int idx = tid; idx < active_rows * tile_vecs; idx += block_size) {
+      const int row = idx / tile_vecs;
+      const int vi = idx % tile_vecs;
+      const T *in_row = input + (size_t)(row_base + row) * K + tile_base;
+      const float4 value =
+          __ldg(reinterpret_cast<const float4 *>(in_row) + vi);
+      const T *elements = reinterpret_cast<const T *>(&value);
+      const int base = vi * ELEMS_PER_VEC;
+#pragma unroll
+      for (int j = 0; j < ELEMS_PER_VEC; ++j) {
+        const int local_k = base + j;
+        const int smem_idx = row * shared_row_stride + local_k +
+                             local_k / WARP_SIZE;
+        if constexpr (std::is_same_v<T, half>) {
+          s_input[smem_idx] = __half2float(elements[j]);
+        } else {
+          s_input[smem_idx] = __bfloat162float(elements[j]);
+        }
+      }
+    }
+#endif
+    __syncthreads();
+
+    if (active_output) {
+      for (int local_k = lane_id * ELEMS_PER_LANE; local_k < tile_k;
+           local_k += WARP_SIZE * ELEMS_PER_LANE) {
+        const int k = tile_base + local_k;
+
+#ifdef NVFP4_HW_DEQUANT
+        if (!force_lut) {
+          const int local_k2 = local_k + NVFP4_BLOCK_SIZE;
+          const int k2 = k + NVFP4_BLOCK_SIZE;
+          if (local_k2 < tile_k) {
+            const uint16_t raw_scales = load_uint16_safe(
+                w_scale_row + k / NVFP4_BLOCK_SIZE);
+            const float2 block_scales = fp8x2_scale_to_float2(raw_scales);
+            const uint2 packed =
+                __ldg(reinterpret_cast<const uint2 *>(w_row + k / 2));
+            const uint2 packed2 =
+                __ldg(reinterpret_cast<const uint2 *>(w_row + k2 / 2));
+            grouped_hw_dot_16<ROWS>(
+                packed, block_scales.x * weight_global_scale, s_input,
+                shared_row_stride, local_k, active_rows, acc);
+            grouped_hw_dot_16<ROWS>(
+                packed2, block_scales.y * weight_global_scale, s_input,
+                shared_row_stride, local_k2, active_rows, acc);
+          } else {
+            const float block_scale = fp8_scale_to_float(
+                                          __ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
+                                      weight_global_scale;
+            const uint2 packed =
+                __ldg(reinterpret_cast<const uint2 *>(w_row + k / 2));
+            grouped_hw_dot_16<ROWS>(packed, block_scale, s_input,
+                                    shared_row_stride, local_k, active_rows,
+                                    acc);
+          }
+        } else
+#endif
+        {
+          const float block_scale =
+              dispatch_fp8_to_float(
+                  __ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
+              weight_global_scale * 0.5f;
+          const uint2 packed = load_uint2_safe(w_row + k / 2);
+          grouped_lut_dot_16<ROWS>(
+              packed, block_scale, s_input, shared_row_stride, local_k,
+              active_rows, acc, LUT0, LUT1, LUT2, LUT3);
+
+          const int local_k2 = local_k + NVFP4_BLOCK_SIZE;
+          if (local_k2 < tile_k) {
+            const int k2 = k + NVFP4_BLOCK_SIZE;
+            const float block_scale2 =
+                dispatch_fp8_to_float(
+                    __ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
+                weight_global_scale * 0.5f;
+            const uint2 packed2 = load_uint2_safe(w_row + k2 / 2);
+            grouped_lut_dot_16<ROWS>(
+                packed2, block_scale2, s_input, shared_row_stride, local_k2,
+                active_rows, acc, LUT0, LUT1, LUT2, LUT3);
+          }
+        }
+      }
+    }
+
+    if constexpr (TILED)
+      __syncthreads();
+  }
+
+  if (!active_output)
+    return;
+
+#pragma unroll
+  for (int offset = 16; offset > 0; offset /= 2) {
+#pragma unroll
+    for (int row = 0; row < ROWS; ++row) {
+      acc[row] += __shfl_down_sync(0xffffffff, acc[row], offset);
+    }
+  }
+
+  if (lane_id == 0) {
+#pragma unroll
+    for (int row = 0; row < ROWS; ++row) {
+      if (row >= active_rows)
+        continue;
+      float value = acc[row];
+      if (has_bias && bias != nullptr) {
+        if constexpr (std::is_same_v<T, half>) {
+          value += __half2float(__ldg(&bias[n_idx]));
+        } else {
+          value += __bfloat162float(__ldg(&bias[n_idx]));
+        }
+      }
+      if constexpr (std::is_same_v<T, half>) {
+        output[(size_t)(row_base + row) * N + n_idx] = __float2half(value);
+      } else {
+        output[(size_t)(row_base + row) * N + n_idx] =
+            __float2bfloat16_rn(value);
+      }
+    }
+  }
+}
+
 // Tiled matmul for larger M: NVFP4 version
 template <typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int TM, int TN>
 __global__ void nvfp4_matmul_tiled(const T *__restrict__ input,
@@ -1147,6 +1415,131 @@ __global__ void nvfp4_wmma_matmul_kernel(
 // ============================================================================
 // C API
 // ============================================================================
+
+template <typename T, int ROWS, bool TILED>
+static cudaError_t launch_nvfp4_matmul_smallm_grouped(
+    const T *input, const uint8_t *weight, const uint8_t *weight_scale,
+    float weight_global_scale, const T *bias, T *output, int M, int N, int K,
+    bool has_bias, bool force_lut, cudaStream_t stream) {
+  using namespace nvfp4_gemm;
+  constexpr int THREADS = BLOCK_N_SM * WARP_SIZE;
+  dim3 block(THREADS);
+  dim3 grid(CEILDIV(N, BLOCK_N_SM), CEILDIV(M, ROWS));
+  const int shared_k = TILED && K > SMALLM_TILE_K ? SMALLM_TILE_K : K;
+  const size_t smem =
+      (size_t)ROWS * (shared_k + CEILDIV(shared_k, WARP_SIZE)) * sizeof(float);
+  auto kernel =
+      nvfp4_gemm::nvfp4_matmul_smallm_grouped_kernel<T, ROWS, TILED>;
+  if (smem > 48 * 1024) {
+    const cudaError_t status = cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (status != cudaSuccess)
+      return status;
+  }
+  kernel<<<grid, block, smem, stream>>>(
+      input, weight, weight_scale, weight_global_scale, bias, output, M, N, K,
+      has_bias, force_lut);
+  return cudaPeekAtLastError();
+}
+
+extern "C" cudaError_t nvfp4_matmul_smallm_rows2_f16(
+    const __half *input, const uint8_t *weight, const uint8_t *weight_scale,
+    float weight_global_scale, const __half *bias, __half *output, int M, int N,
+    int K, bool has_bias, bool force_lut, cudaStream_t stream) {
+  return launch_nvfp4_matmul_smallm_grouped<half, 2, false>(
+      input, weight, weight_scale, weight_global_scale, bias, output, M, N, K,
+      has_bias, force_lut, stream);
+}
+
+extern "C" cudaError_t nvfp4_matmul_smallm_rows3_f16(
+    const __half *input, const uint8_t *weight, const uint8_t *weight_scale,
+    float weight_global_scale, const __half *bias, __half *output, int M, int N,
+    int K, bool has_bias, bool force_lut, cudaStream_t stream) {
+  return launch_nvfp4_matmul_smallm_grouped<half, 3, false>(
+      input, weight, weight_scale, weight_global_scale, bias, output, M, N, K,
+      has_bias, force_lut, stream);
+}
+
+extern "C" cudaError_t nvfp4_matmul_smallm_tiled_rows2_f16(
+    const __half *input, const uint8_t *weight, const uint8_t *weight_scale,
+    float weight_global_scale, const __half *bias, __half *output, int M, int N,
+    int K, bool has_bias, bool force_lut, cudaStream_t stream) {
+  return launch_nvfp4_matmul_smallm_grouped<half, 2, true>(
+      input, weight, weight_scale, weight_global_scale, bias, output, M, N, K,
+      has_bias, force_lut, stream);
+}
+
+extern "C" cudaError_t nvfp4_matmul_smallm_tiled_rows3_f16(
+    const __half *input, const uint8_t *weight, const uint8_t *weight_scale,
+    float weight_global_scale, const __half *bias, __half *output, int M, int N,
+    int K, bool has_bias, bool force_lut, cudaStream_t stream) {
+  return launch_nvfp4_matmul_smallm_grouped<half, 3, true>(
+      input, weight, weight_scale, weight_global_scale, bias, output, M, N, K,
+      has_bias, force_lut, stream);
+}
+
+#ifndef NO_BF16_KERNEL
+extern "C" cudaError_t nvfp4_matmul_smallm_rows2_bf16(
+    const __nv_bfloat16 *input, const uint8_t *weight,
+    const uint8_t *weight_scale, float weight_global_scale,
+    const __nv_bfloat16 *bias, __nv_bfloat16 *output, int M, int N, int K,
+    bool has_bias, bool force_lut, cudaStream_t stream) {
+  return launch_nvfp4_matmul_smallm_grouped<__nv_bfloat16, 2, false>(
+      input, weight, weight_scale, weight_global_scale, bias, output, M, N, K,
+      has_bias, force_lut, stream);
+}
+
+extern "C" cudaError_t nvfp4_matmul_smallm_rows3_bf16(
+    const __nv_bfloat16 *input, const uint8_t *weight,
+    const uint8_t *weight_scale, float weight_global_scale,
+    const __nv_bfloat16 *bias, __nv_bfloat16 *output, int M, int N, int K,
+    bool has_bias, bool force_lut, cudaStream_t stream) {
+  return launch_nvfp4_matmul_smallm_grouped<__nv_bfloat16, 3, false>(
+      input, weight, weight_scale, weight_global_scale, bias, output, M, N, K,
+      has_bias, force_lut, stream);
+}
+
+extern "C" cudaError_t nvfp4_matmul_smallm_tiled_rows2_bf16(
+    const __nv_bfloat16 *input, const uint8_t *weight,
+    const uint8_t *weight_scale, float weight_global_scale,
+    const __nv_bfloat16 *bias, __nv_bfloat16 *output, int M, int N, int K,
+    bool has_bias, bool force_lut, cudaStream_t stream) {
+  return launch_nvfp4_matmul_smallm_grouped<__nv_bfloat16, 2, true>(
+      input, weight, weight_scale, weight_global_scale, bias, output, M, N, K,
+      has_bias, force_lut, stream);
+}
+
+extern "C" cudaError_t nvfp4_matmul_smallm_tiled_rows3_bf16(
+    const __nv_bfloat16 *input, const uint8_t *weight,
+    const uint8_t *weight_scale, float weight_global_scale,
+    const __nv_bfloat16 *bias, __nv_bfloat16 *output, int M, int N, int K,
+    bool has_bias, bool force_lut, cudaStream_t stream) {
+  return launch_nvfp4_matmul_smallm_grouped<__nv_bfloat16, 3, true>(
+      input, weight, weight_scale, weight_global_scale, bias, output, M, N, K,
+      has_bias, force_lut, stream);
+}
+#else
+extern "C" cudaError_t nvfp4_matmul_smallm_rows2_bf16(
+    const void *, const uint8_t *, const uint8_t *, float, const void *, void *,
+    int, int, int, bool, bool, cudaStream_t) {
+  return cudaErrorNotSupported;
+}
+extern "C" cudaError_t nvfp4_matmul_smallm_rows3_bf16(
+    const void *, const uint8_t *, const uint8_t *, float, const void *, void *,
+    int, int, int, bool, bool, cudaStream_t) {
+  return cudaErrorNotSupported;
+}
+extern "C" cudaError_t nvfp4_matmul_smallm_tiled_rows2_bf16(
+    const void *, const uint8_t *, const uint8_t *, float, const void *, void *,
+    int, int, int, bool, bool, cudaStream_t) {
+  return cudaErrorNotSupported;
+}
+extern "C" cudaError_t nvfp4_matmul_smallm_tiled_rows3_bf16(
+    const void *, const uint8_t *, const uint8_t *, float, const void *, void *,
+    int, int, int, bool, bool, cudaStream_t) {
+  return cudaErrorNotSupported;
+}
+#endif
 
 extern "C" cudaError_t nvfp4_matmul_smallm_f16(const __half *input,
                                          const uint8_t *weight,

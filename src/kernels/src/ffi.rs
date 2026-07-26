@@ -2712,6 +2712,126 @@ extern "C" {
         stream: i64,
     ) -> c_int;
 
+    pub fn nvfp4_matmul_smallm_rows2_f16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        weight_global_scale: f32,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        force_lut: bool,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn nvfp4_matmul_smallm_rows2_bf16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        weight_global_scale: f32,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        force_lut: bool,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn nvfp4_matmul_smallm_rows3_f16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        weight_global_scale: f32,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        force_lut: bool,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn nvfp4_matmul_smallm_rows3_bf16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        weight_global_scale: f32,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        force_lut: bool,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn nvfp4_matmul_smallm_tiled_rows2_f16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        weight_global_scale: f32,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        force_lut: bool,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn nvfp4_matmul_smallm_tiled_rows2_bf16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        weight_global_scale: f32,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        force_lut: bool,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn nvfp4_matmul_smallm_tiled_rows3_f16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        weight_global_scale: f32,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        force_lut: bool,
+        stream: i64,
+    ) -> c_int;
+
+    pub fn nvfp4_matmul_smallm_tiled_rows3_bf16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        weight_global_scale: f32,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        force_lut: bool,
+        stream: i64,
+    ) -> c_int;
+
     pub fn nvfp4_matmul_f16(
         input: *const c_void,
         weight: *const u8,
