@@ -25,8 +25,8 @@ enum DecodeKernel {
 /// Optional grouped-row specialization selected before the unchanged per-row route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GroupedDecodeKernel {
-    Full,
-    Tiled,
+    Full(usize),
+    Tiled(usize),
     Fallback(DecodeKernel),
 }
 
@@ -104,16 +104,20 @@ fn select_grouped_decode_kernel(
     max_shared_memory_bytes: usize,
     hardware_fp4_available: bool,
 ) -> Result<GroupedDecodeKernel> {
-    if !matches!(rows, 2 | 3) {
-        candle_core::bail!("grouped NVFP4 decode supports exactly 2 or 3 rows, got {rows}")
+    let group_rows = match rows {
+        2 | 3 => rows,
+        // Four decode rows are two resource-safe pairs. This preserves weight
+        // reuse without requiring 4×K shared memory in one CTA.
+        4 => 2,
+        _ => {
+            candle_core::bail!("grouped NVFP4 decode supports exactly 2, 3, or 4 rows, got {rows}")
+        }
+    };
+    if grouped_smallm_shared_memory_bytes(group_rows, k)? <= max_shared_memory_bytes {
+        return Ok(GroupedDecodeKernel::Full(group_rows));
     }
-
-    if grouped_smallm_shared_memory_bytes(rows, k)? <= max_shared_memory_bytes {
-        return Ok(GroupedDecodeKernel::Full);
-    }
-
-    if grouped_smallm_tiled_shared_memory_bytes(rows, k)? <= max_shared_memory_bytes {
-        return Ok(GroupedDecodeKernel::Tiled);
+    if grouped_smallm_tiled_shared_memory_bytes(group_rows, k)? <= max_shared_memory_bytes {
+        return Ok(GroupedDecodeKernel::Tiled(group_rows));
     }
 
     select_decode_kernel(k, n, max_shared_memory_bytes, hardware_fp4_available)
@@ -159,8 +163,8 @@ unsafe fn launch_grouped_smallm(
     let m = cuda_dimension(m, "M")?;
     let n = cuda_dimension(n, "N")?;
     let k = cuda_dimension(k, "K")?;
-    let status = match (kernel, m, dtype) {
-        (GroupedDecodeKernel::Full, 2, DType::F16) => ffi::nvfp4_matmul_smallm_rows2_f16(
+    let status = match (kernel, dtype) {
+        (GroupedDecodeKernel::Full(2), DType::F16) => ffi::nvfp4_matmul_smallm_rows2_f16(
             input,
             weight,
             scale,
@@ -174,7 +178,7 @@ unsafe fn launch_grouped_smallm(
             force_lut,
             stream,
         ),
-        (GroupedDecodeKernel::Full, 2, DType::BF16) => ffi::nvfp4_matmul_smallm_rows2_bf16(
+        (GroupedDecodeKernel::Full(2), DType::BF16) => ffi::nvfp4_matmul_smallm_rows2_bf16(
             input,
             weight,
             scale,
@@ -188,7 +192,7 @@ unsafe fn launch_grouped_smallm(
             force_lut,
             stream,
         ),
-        (GroupedDecodeKernel::Full, 3, DType::F16) => ffi::nvfp4_matmul_smallm_rows3_f16(
+        (GroupedDecodeKernel::Full(3), DType::F16) => ffi::nvfp4_matmul_smallm_rows3_f16(
             input,
             weight,
             scale,
@@ -202,7 +206,7 @@ unsafe fn launch_grouped_smallm(
             force_lut,
             stream,
         ),
-        (GroupedDecodeKernel::Full, 3, DType::BF16) => ffi::nvfp4_matmul_smallm_rows3_bf16(
+        (GroupedDecodeKernel::Full(3), DType::BF16) => ffi::nvfp4_matmul_smallm_rows3_bf16(
             input,
             weight,
             scale,
@@ -216,7 +220,7 @@ unsafe fn launch_grouped_smallm(
             force_lut,
             stream,
         ),
-        (GroupedDecodeKernel::Tiled, 2, DType::F16) => {
+        (GroupedDecodeKernel::Tiled(2), DType::F16) => {
             ffi::nvfp4_matmul_smallm_tiled_rows2_f16(
                 input,
                 weight,
@@ -232,7 +236,7 @@ unsafe fn launch_grouped_smallm(
                 stream,
             )
         }
-        (GroupedDecodeKernel::Tiled, 2, DType::BF16) => {
+        (GroupedDecodeKernel::Tiled(2), DType::BF16) => {
             ffi::nvfp4_matmul_smallm_tiled_rows2_bf16(
                 input,
                 weight,
@@ -248,7 +252,7 @@ unsafe fn launch_grouped_smallm(
                 stream,
             )
         }
-        (GroupedDecodeKernel::Tiled, 3, DType::F16) => {
+        (GroupedDecodeKernel::Tiled(3), DType::F16) => {
             ffi::nvfp4_matmul_smallm_tiled_rows3_f16(
                 input,
                 weight,
@@ -264,7 +268,7 @@ unsafe fn launch_grouped_smallm(
                 stream,
             )
         }
-        (GroupedDecodeKernel::Tiled, 3, DType::BF16) => {
+        (GroupedDecodeKernel::Tiled(3), DType::BF16) => {
             ffi::nvfp4_matmul_smallm_tiled_rows3_bf16(
                 input,
                 weight,
@@ -606,7 +610,7 @@ pub fn nvfp4_matmul(
             } else {
                 None
             };
-            let grouped_decode_kernel = if !is_prefill && matches!(m, 2 | 3) {
+            let grouped_decode_kernel = if !is_prefill && matches!(m, 2 | 3 | 4) {
                 Some(select_grouped_decode_kernel(
                     m,
                     k,
@@ -877,8 +881,8 @@ pub fn nvfp4_matmul(
 
                 unsafe {
                     if let Some(grouped_kernel) = match grouped_decode_kernel {
-                        Some(GroupedDecodeKernel::Full) => Some(GroupedDecodeKernel::Full),
-                        Some(GroupedDecodeKernel::Tiled) => Some(GroupedDecodeKernel::Tiled),
+                        Some(kernel @ GroupedDecodeKernel::Full(_)) => Some(kernel),
+                        Some(kernel @ GroupedDecodeKernel::Tiled(_)) => Some(kernel),
                         Some(GroupedDecodeKernel::Fallback(_)) | None => None,
                     } {
                         let status = launch_grouped_smallm(
@@ -898,8 +902,8 @@ pub fn nvfp4_matmul(
                             stream,
                         )?;
                         let kernel_name = match grouped_kernel {
-                            GroupedDecodeKernel::Full => "NVFP4 grouped small-M",
-                            GroupedDecodeKernel::Tiled => "NVFP4 grouped tiled small-M",
+                            GroupedDecodeKernel::Full(_) => "NVFP4 grouped small-M",
+                            GroupedDecodeKernel::Tiled(_) => "NVFP4 grouped tiled small-M",
                             GroupedDecodeKernel::Fallback(_) => unreachable!(),
                         };
                         cuda_launch_status(status, kernel_name)?;
@@ -1308,7 +1312,7 @@ mod tests {
             DecodeKernel::SmallMTiled
         );
         assert!(select_grouped_decode_kernel(1, 5_120, 17, 101_376, false).is_err());
-        assert!(select_grouped_decode_kernel(4, 5_120, 17, 101_376, false).is_err());
+        assert!(select_grouped_decode_kernel(5, 5_120, 17, 101_376, false).is_err());
     }
 
     #[test]
@@ -1323,11 +1327,15 @@ mod tests {
         );
         assert_eq!(
             select_grouped_decode_kernel(2, 5_120, 17, 42_240, false).unwrap(),
-            GroupedDecodeKernel::Full
+            GroupedDecodeKernel::Full(2)
         );
         assert_eq!(
             select_grouped_decode_kernel(3, 5_120, 17, 63_360, false).unwrap(),
-            GroupedDecodeKernel::Full
+            GroupedDecodeKernel::Full(3)
+        );
+        assert_eq!(
+            select_grouped_decode_kernel(4, 5_120, 17, 84_480, false).unwrap(),
+            GroupedDecodeKernel::Full(2)
         );
     }
 
@@ -1343,11 +1351,11 @@ mod tests {
         );
         assert_eq!(
             select_grouped_decode_kernel(2, 25_600, 17, 67_584, false).unwrap(),
-            GroupedDecodeKernel::Tiled
+            GroupedDecodeKernel::Tiled(2)
         );
         assert_eq!(
             select_grouped_decode_kernel(3, 25_600, 17, 101_376, false).unwrap(),
-            GroupedDecodeKernel::Tiled
+            GroupedDecodeKernel::Tiled(3)
         );
     }
 
@@ -1355,7 +1363,7 @@ mod tests {
     fn grouped_full_accepts_exact_shared_memory_limit() {
         assert_eq!(
             select_grouped_decode_kernel(3, 8_192, 17, 101_376, false).unwrap(),
-            GroupedDecodeKernel::Full
+            GroupedDecodeKernel::Full(3)
         );
     }
 
@@ -1723,10 +1731,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn grouped_smallm_matches_single_row_kernels_on_gpu1() -> candle_core::Result<()> {
-        let dev = match Device::new_cuda(1) {
-            Ok(dev) => dev,
-            Err(_) => return Ok(()),
-        };
+        let dev = Device::new_cuda(0)?;
         for dtype in [DType::F16, DType::BF16] {
             for force_lut in [false, true] {
                 assert_grouped_matches_single_row(
@@ -1740,6 +1745,12 @@ mod tests {
                 )?;
                 assert_grouped_matches_single_row(
                     &dev, 3, 3, 17_424, true, true, dtype, force_lut,
+                )?;
+                assert_grouped_matches_single_row(
+                    &dev, 4, 2, 5_120, false, true, dtype, force_lut,
+                )?;
+                assert_grouped_matches_single_row(
+                    &dev, 4, 2, 17_424, true, false, dtype, force_lut,
                 )?;
             }
         }
