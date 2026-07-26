@@ -3,7 +3,7 @@ use crate::kernels::ffi;
 #[cfg(feature = "metal")]
 use crate::metal_kernels;
 #[cfg(all(feature = "cuda", feature = "cutlass"))]
-use crate::workspace::get_cutlass_workspace;
+use crate::workspace::{get_cutlass_workspace, get_nvfp4_decode_scratch};
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 #[cfg(feature = "cuda")]
@@ -11,6 +11,91 @@ use candle_core::DType;
 use candle_core::{Result, Tensor};
 
 pub const NVFP4_BLOCK_SIZE: usize = 16;
+const WARP_SIZE: usize = 32;
+
+/// Kernel selected for single-token NVFP4 decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecodeKernel {
+    SmallM,
+    HardwareFp4,
+}
+
+/// Dynamic shared memory requested by the small-M CUDA kernel.
+///
+/// The kernel stores `K` dequantized values plus one partial sum per warp,
+/// all as `f32` values.
+fn smallm_shared_memory_bytes(k: usize) -> Result<usize> {
+    let warp_count = k
+        .checked_add(WARP_SIZE - 1)
+        .ok_or_else(|| candle_core::Error::Msg("small-M warp count overflow".into()))?
+        / WARP_SIZE;
+    k.checked_add(warp_count)
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| candle_core::Error::Msg("small-M shared-memory size overflow".into()))
+}
+
+/// Select a safe decode kernel from dimensions and device capabilities only.
+fn select_decode_kernel(
+    k: usize,
+    n: usize,
+    max_shared_memory_bytes: usize,
+    hardware_fp4_available: bool,
+) -> Result<DecodeKernel> {
+    let required_shared_memory_bytes = smallm_shared_memory_bytes(k)?;
+    if required_shared_memory_bytes <= max_shared_memory_bytes {
+        return Ok(DecodeKernel::SmallM);
+    }
+
+    if hardware_fp4_available && k % 32 == 0 && n % 32 == 0 {
+        return Ok(DecodeKernel::HardwareFp4);
+    }
+
+    candle_core::bail!(
+        "NVFP4 small-M decode requires {required_shared_memory_bytes} bytes of shared memory, \
+         but the device limit is {max_shared_memory_bytes} bytes and hardware FP4 fallback unavailable \
+         for K={k}, N={n}"
+    )
+}
+
+/// Converts the CUDA wrapper's immediate launch status into a Candle error.
+fn cuda_launch_status(status: i32, kernel: &str) -> Result<()> {
+    if status == 0 {
+        Ok(())
+    } else {
+        candle_core::bail!("{kernel} launch failed with CUDA error {status}")
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn max_optin_shared_memory_bytes(cuda_dev: &candle_core::CudaDevice) -> Result<usize> {
+    use candle_core::cuda_backend::cudarc::driver::sys::CUdevice_attribute;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        // Decode calls this function for every projection. Cache the immutable
+        // device attribute per worker thread to keep the hot path lock-free.
+        static MAX_OPTIN_SHARED_MEMORY_BY_DEVICE: RefCell<HashMap<usize, usize>> =
+            RefCell::new(HashMap::new());
+    }
+
+    let device = cuda_dev.cuda_device();
+    let ordinal = device.ordinal();
+    if let Some(bytes) =
+        MAX_OPTIN_SHARED_MEMORY_BY_DEVICE.with(|limits| limits.borrow().get(&ordinal).copied())
+    {
+        return Ok(bytes);
+    }
+
+    let bytes = device
+        .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
+        .map_err(candle_core::Error::wrap)?;
+    let bytes = usize::try_from(bytes).map_err(candle_core::Error::wrap)?;
+    MAX_OPTIN_SHARED_MEMORY_BY_DEVICE.with(|limits| {
+        limits.borrow_mut().insert(ordinal, bytes);
+    });
+    Ok(bytes)
+}
 
 /// Compute online input scale from the activation tensor's max absolute value.
 /// Returns (input_scale, input_scale_inv) where input_scale = amax(|x|) / 6.0.
@@ -199,8 +284,10 @@ pub fn swizzle_nvfp4_weight_scales(scale: &Tensor) -> Result<Tensor> {
 /// * `weight_scale_swizzled` - Optional pre-swizzled weight scales from
 ///   [`swizzle_nvfp4_weight_scales`]. When provided, skips per-call swizzling.
 ///
-/// On Blackwell (SM100+) with cutlass feature: uses hardware FP4 tensor cores
-/// via CUTLASS block-scaled GEMM (quantizes activations to FP4 on-the-fly).
+/// On Blackwell (SM100+) with cutlass feature: prefill uses hardware FP4 tensor
+/// cores. Single-token decode prefers the lower-overhead small-M kernel and
+/// falls back to CUTLASS only when the small-M shared-memory requirement
+/// exceeds the device limit.
 /// On older GPUs: uses software dequant path (LUT-based FP4 decode + FMA/WMMA).
 ///
 /// Returns [M, N] in same dtype as input
@@ -284,12 +371,24 @@ pub fn nvfp4_matmul(
                 && n % 32 == 0
                 && k % 32 == 0;
 
-            let use_hardware_fp4 = !use_flashinfer_fp4
-                && cfg!(feature = "cutlass")
+            let hardware_fp4_available = cfg!(feature = "cutlass")
                 && is_hardware_fp4_available(dev)
-                && is_prefill
                 && n % 32 == 0
                 && k % 32 == 0;
+            let decode_kernel = if !is_prefill && m < 32 {
+                Some(select_decode_kernel(
+                    k,
+                    n,
+                    max_optin_shared_memory_bytes(cuda_dev)?,
+                    hardware_fp4_available,
+                )?)
+            } else {
+                None
+            };
+
+            let use_hardware_fp4 = !use_flashinfer_fp4
+                && hardware_fp4_available
+                && (is_prefill || decode_kernel == Some(DecodeKernel::HardwareFp4));
 
             let output = Tensor::zeros((m, n), dtype, dev)?;
             let has_bias = bias.is_some();
@@ -304,10 +403,26 @@ pub fn nvfp4_matmul(
                     let k_scale_padded = pad_to(k_scale_cols, 4);
                     let n_padded = pad_to(n, 128);
 
-                    let act_packed = Tensor::zeros((m, k / 2), DType::U8, dev)?;
-                    let act_scales = Tensor::zeros((m_padded, k_scale_cols), DType::U8, dev)?;
-                    let act_scales_swizzled =
-                        Tensor::zeros((m_padded, k_scale_padded), DType::U8, dev)?;
+                    let decode_scratch = if decode_kernel == Some(DecodeKernel::HardwareFp4) {
+                        Some(get_nvfp4_decode_scratch(cuda_dev, m, k)?)
+                    } else {
+                        None
+                    };
+                    let act_packed = if decode_scratch.is_none() {
+                        Some(Tensor::zeros((m, k / 2), DType::U8, dev)?)
+                    } else {
+                        None
+                    };
+                    let act_scales = if decode_scratch.is_none() {
+                        Some(Tensor::zeros((m_padded, k_scale_cols), DType::U8, dev)?)
+                    } else {
+                        None
+                    };
+                    let act_scales_swizzled = if decode_scratch.is_none() {
+                        Some(Tensor::zeros((m_padded, k_scale_padded), DType::U8, dev)?)
+                    } else {
+                        None
+                    };
 
                     let wscale_sw_owned;
                     let wscale_sw_ref = if let Some(preswizzled) = weight_scale_swizzled {
@@ -334,17 +449,32 @@ pub fn nvfp4_matmul(
                         let (input_s, _) = input.storage_and_layout();
                         let input_ptr = cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void;
 
-                        let (act_packed_s, _) = act_packed.storage_and_layout();
-                        let act_packed_ptr =
-                            cuda_ptr(&act_packed_s, DType::U8)? as *mut std::ffi::c_void;
-
-                        let (act_scales_s, _) = act_scales.storage_and_layout();
-                        let act_scales_ptr =
-                            cuda_ptr(&act_scales_s, DType::U8)? as *mut std::ffi::c_void;
-
-                        let (act_scales_sw_s, _) = act_scales_swizzled.storage_and_layout();
-                        let act_scales_sw_ptr =
-                            cuda_ptr(&act_scales_sw_s, DType::U8)? as *mut std::ffi::c_void;
+                        let (act_packed_ptr, act_scales_ptr, act_scales_sw_ptr) =
+                            if let Some(scratch) = decode_scratch.as_ref() {
+                                (
+                                    scratch.act_packed as *mut std::ffi::c_void,
+                                    scratch.act_scales as *mut std::ffi::c_void,
+                                    scratch.act_scales_swizzled as *mut std::ffi::c_void,
+                                )
+                            } else {
+                                let (act_packed_s, _) = act_packed
+                                    .as_ref()
+                                    .expect("owned packed activation")
+                                    .storage_and_layout();
+                                let (act_scales_s, _) = act_scales
+                                    .as_ref()
+                                    .expect("owned activation scales")
+                                    .storage_and_layout();
+                                let (act_scales_sw_s, _) = act_scales_swizzled
+                                    .as_ref()
+                                    .expect("owned swizzled activation scales")
+                                    .storage_and_layout();
+                                (
+                                    cuda_ptr(&act_packed_s, DType::U8)? as *mut std::ffi::c_void,
+                                    cuda_ptr(&act_scales_s, DType::U8)? as *mut std::ffi::c_void,
+                                    cuda_ptr(&act_scales_sw_s, DType::U8)? as *mut std::ffi::c_void,
+                                )
+                            };
 
                         let (weight_s, _) = weight.storage_and_layout();
                         let weight_ptr =
@@ -515,44 +645,41 @@ pub fn nvfp4_matmul(
 
                 unsafe {
                     if m < 32 {
-                        match dtype {
-                            DType::F16 => {
-                                ffi::nvfp4_matmul_smallm_f16(
-                                    input_ptr,
-                                    weight_ptr,
-                                    scale_ptr,
-                                    weight_global_scale,
-                                    bias_ptr,
-                                    output_ptr,
-                                    m as i32,
-                                    n as i32,
-                                    k as i32,
-                                    has_bias,
-                                    force_lut,
-                                    stream,
-                                );
-                            }
-                            DType::BF16 => {
-                                ffi::nvfp4_matmul_smallm_bf16(
-                                    input_ptr,
-                                    weight_ptr,
-                                    scale_ptr,
-                                    weight_global_scale,
-                                    bias_ptr,
-                                    output_ptr,
-                                    m as i32,
-                                    n as i32,
-                                    k as i32,
-                                    has_bias,
-                                    force_lut,
-                                    stream,
-                                );
-                            }
+                        let status = match dtype {
+                            DType::F16 => ffi::nvfp4_matmul_smallm_f16(
+                                input_ptr,
+                                weight_ptr,
+                                scale_ptr,
+                                weight_global_scale,
+                                bias_ptr,
+                                output_ptr,
+                                m as i32,
+                                n as i32,
+                                k as i32,
+                                has_bias,
+                                force_lut,
+                                stream,
+                            ),
+                            DType::BF16 => ffi::nvfp4_matmul_smallm_bf16(
+                                input_ptr,
+                                weight_ptr,
+                                scale_ptr,
+                                weight_global_scale,
+                                bias_ptr,
+                                output_ptr,
+                                m as i32,
+                                n as i32,
+                                k as i32,
+                                has_bias,
+                                force_lut,
+                                stream,
+                            ),
                             _ => candle_core::bail!(
                                 "nvfp4_matmul CUDA: unsupported dtype {:?}",
                                 dtype
                             ),
-                        }
+                        };
+                        cuda_launch_status(status, "NVFP4 small-M")?;
                     } else {
                         match dtype {
                             DType::F16 => {
@@ -766,6 +893,69 @@ pub fn mlx_repack_u32_to_u8(weight_u32: &Tensor) -> Result<Tensor> {
             mlx_repack_u32_to_u8_metal(&weight_u32, rows, u32_cols)
         }
         _ => candle_core::bail!("mlx_repack_u32_to_u8: unsupported backend (need CUDA or Metal)"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        cuda_launch_status, select_decode_kernel, smallm_shared_memory_bytes, DecodeKernel,
+    };
+
+    const RTX_5090_MAX_OPTIN_SHARED_MEMORY: usize = 101_376;
+
+    #[test]
+    fn shared_memory_matches_smallm_kernel_layout() {
+        assert_eq!(smallm_shared_memory_bytes(17_408).unwrap(), 71_808);
+        assert_eq!(smallm_shared_memory_bytes(25_600).unwrap(), 105_600);
+    }
+
+    #[test]
+    fn selects_smallm_at_device_limit() {
+        assert_eq!(
+            select_decode_kernel(24_576, 8_192, 101_376, true).unwrap(),
+            DecodeKernel::SmallM
+        );
+    }
+
+    #[test]
+    fn falls_back_to_hardware_when_smallm_exceeds_device_limit() {
+        assert_eq!(
+            select_decode_kernel(25_600, 5_120, RTX_5090_MAX_OPTIN_SHARED_MEMORY, true).unwrap(),
+            DecodeKernel::HardwareFp4
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_smallm_without_hardware_fallback() {
+        let err = select_decode_kernel(25_600, 5_120, RTX_5090_MAX_OPTIN_SHARED_MEMORY, false)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("requires 105600 bytes"));
+        assert!(err.to_string().contains("device limit is 101376 bytes"));
+    }
+
+    #[test]
+    fn rejects_hardware_fallback_for_unaligned_dimensions() {
+        let err = select_decode_kernel(25_600, 5_121, 101_376, true).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("hardware FP4 fallback unavailable"));
+    }
+
+    #[test]
+    fn shared_memory_calculation_rejects_overflow() {
+        assert!(smallm_shared_memory_bytes(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn cuda_launch_status_propagates_native_errors() {
+        assert!(cuda_launch_status(0, "small-M BF16").is_ok());
+        let err = cuda_launch_status(9, "small-M BF16").unwrap_err();
+
+        assert!(err.to_string().contains("small-M BF16"));
+        assert!(err.to_string().contains("CUDA error 9"));
     }
 }
 

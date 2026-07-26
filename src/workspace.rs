@@ -91,6 +91,50 @@ pub const WORKSPACE_REGIONS: WorkspaceRegions = WorkspaceRegions {
     },
 };
 
+/// Byte capacities required by the temporary buffers for one dense NVFP4
+/// hardware decode projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Nvfp4DecodeScratchSizes {
+    pub act_packed: usize,
+    pub act_scales: usize,
+    pub act_scales_swizzled: usize,
+}
+
+/// Computes dense NVFP4 decode scratch sizes without allocating device memory.
+pub(crate) fn nvfp4_decode_scratch_sizes(m: usize, k: usize) -> Result<Nvfp4DecodeScratchSizes> {
+    if k % 16 != 0 {
+        candle_core::bail!("NVFP4 decode scratch requires K divisible by 16, got {k}")
+    }
+
+    let m_padded = m
+        .checked_add(127)
+        .ok_or_else(|| candle_core::Error::Msg("NVFP4 decode M padding overflow".into()))?
+        / 128
+        * 128;
+    let k_scale_cols = k / 16;
+    let k_scale_padded = k_scale_cols
+        .checked_add(3)
+        .ok_or_else(|| candle_core::Error::Msg("NVFP4 decode K-scale padding overflow".into()))?
+        / 4
+        * 4;
+
+    let act_packed = m
+        .checked_mul(k / 2)
+        .ok_or_else(|| candle_core::Error::Msg("NVFP4 packed activation size overflow".into()))?;
+    let act_scales = m_padded
+        .checked_mul(k_scale_cols)
+        .ok_or_else(|| candle_core::Error::Msg("NVFP4 activation-scale size overflow".into()))?;
+    let act_scales_swizzled = m_padded.checked_mul(k_scale_padded).ok_or_else(|| {
+        candle_core::Error::Msg("NVFP4 swizzled activation-scale size overflow".into())
+    })?;
+
+    Ok(Nvfp4DecodeScratchSizes {
+        act_packed,
+        act_scales,
+        act_scales_swizzled,
+    })
+}
+
 /// Returns the workspace regions after validating they don't overlap.
 pub fn workspace_regions() -> WorkspaceRegions {
     debug_assert!(
@@ -127,6 +171,7 @@ pub fn add_workspace_offset(
 #[cfg(feature = "cuda")]
 mod cuda {
     use super::*;
+    use std::collections::HashMap;
 
     /// Page-locked host buffer for FlashInfer scheduler operations.
     pub struct PinnedHostBuffer {
@@ -217,6 +262,81 @@ mod cuda {
         /// Specialized FP8 blockscale workspace.
         #[cfg(feature = "flashinfer")]
         pub static FLASHINFER_FP8_WORKSPACE: std::cell::RefCell<Option<FlashInferFp8Workspace>> = const { std::cell::RefCell::new(None) };
+
+        /// Dense NVFP4 decode scratch keyed by CUDA device and stream.
+        #[cfg(feature = "cutlass")]
+        static NVFP4_DECODE_SCRATCH: std::cell::RefCell<HashMap<(usize, i64), Nvfp4DecodeScratch>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+
+    /// Reusable buffers overwritten by quantization before every CUTLASS call.
+    #[cfg(feature = "cutlass")]
+    struct Nvfp4DecodeScratch {
+        act_packed: CudaSlice<u8>,
+        act_scales: CudaSlice<u8>,
+        act_scales_swizzled: CudaSlice<u8>,
+        sizes: Nvfp4DecodeScratchSizes,
+    }
+
+    /// Raw device pointers into the stream-local dense decode scratch pool.
+    #[cfg(feature = "cutlass")]
+    pub(crate) struct Nvfp4DecodeScratchPtrs {
+        pub act_packed: u64,
+        pub act_scales: u64,
+        pub act_scales_swizzled: u64,
+    }
+
+    /// Returns grow-only dense decode scratch for a single CUDA stream.
+    ///
+    /// Quantization and CUTLASS launches on the same stream consume these
+    /// buffers in order, so later projections may safely overwrite them.
+    #[cfg(feature = "cutlass")]
+    pub(crate) fn get_nvfp4_decode_scratch(
+        dev: &candle_core::cuda_backend::CudaDevice,
+        m: usize,
+        k: usize,
+    ) -> Result<Nvfp4DecodeScratchPtrs> {
+        let required = nvfp4_decode_scratch_sizes(m, k)?;
+        let key = (dev.ordinal(), *dev.cu_stream() as i64);
+
+        NVFP4_DECODE_SCRATCH.with(|cell| {
+            let mut pools = cell.borrow_mut();
+            let needs_reallocation = pools.get(&key).map_or(true, |scratch| {
+                scratch.sizes.act_packed < required.act_packed
+                    || scratch.sizes.act_scales < required.act_scales
+                    || scratch.sizes.act_scales_swizzled < required.act_scales_swizzled
+            });
+
+            if needs_reallocation {
+                let sizes = pools
+                    .get(&key)
+                    .map_or(required, |scratch| Nvfp4DecodeScratchSizes {
+                        act_packed: scratch.sizes.act_packed.max(required.act_packed),
+                        act_scales: scratch.sizes.act_scales.max(required.act_scales),
+                        act_scales_swizzled: scratch
+                            .sizes
+                            .act_scales_swizzled
+                            .max(required.act_scales_swizzled),
+                    });
+                let scratch = Nvfp4DecodeScratch {
+                    act_packed: unsafe { dev.alloc::<u8>(sizes.act_packed.max(1)) }.w()?,
+                    act_scales: unsafe { dev.alloc::<u8>(sizes.act_scales.max(1)) }.w()?,
+                    act_scales_swizzled: unsafe {
+                        dev.alloc::<u8>(sizes.act_scales_swizzled.max(1))
+                    }
+                    .w()?,
+                    sizes,
+                };
+                pools.insert(key, scratch);
+            }
+
+            let scratch = pools.get(&key).expect("NVFP4 decode scratch initialized");
+            Ok(Nvfp4DecodeScratchPtrs {
+                act_packed: *scratch.act_packed.device_ptr(),
+                act_scales: *scratch.act_scales.device_ptr(),
+                act_scales_swizzled: *scratch.act_scales_swizzled.device_ptr(),
+            })
+        })
     }
 
     /// Initializes or retrieves the FlashInfer workspace for the given device.
@@ -516,6 +636,20 @@ pub use cuda::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nvfp4_decode_scratch_sizes_match_m1_down_projection() {
+        let sizes = nvfp4_decode_scratch_sizes(1, 25_600).unwrap();
+
+        assert_eq!(sizes.act_packed, 12_800);
+        assert_eq!(sizes.act_scales, 204_800);
+        assert_eq!(sizes.act_scales_swizzled, 204_800);
+    }
+
+    #[test]
+    fn nvfp4_decode_scratch_sizes_reject_overflow() {
+        assert!(nvfp4_decode_scratch_sizes(usize::MAX, 25_600).is_err());
+    }
 
     #[test]
     fn workspace_regions_do_not_overlap_and_fit() {

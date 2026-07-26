@@ -2638,7 +2638,7 @@ extern "C" {
         has_bias: bool,
         force_lut: bool,
         stream: i64,
-    );
+    ) -> c_int;
 
     pub fn nvfp4_matmul_smallm_bf16(
         input: *const c_void,
@@ -2653,7 +2653,7 @@ extern "C" {
         has_bias: bool,
         force_lut: bool,
         stream: i64,
-    );
+    ) -> c_int;
 
     pub fn nvfp4_matmul_f16(
         input: *const c_void,

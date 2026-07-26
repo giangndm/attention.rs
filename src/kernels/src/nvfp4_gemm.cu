@@ -920,7 +920,7 @@ __global__ void nvfp4_wmma_matmul_kernel(
 // C API
 // ============================================================================
 
-extern "C" void nvfp4_matmul_smallm_f16(const __half *input,
+extern "C" cudaError_t nvfp4_matmul_smallm_f16(const __half *input,
                                          const uint8_t *weight,
                                          const uint8_t *weight_scale,
                                          float weight_global_scale,
@@ -933,14 +933,19 @@ extern "C" void nvfp4_matmul_smallm_f16(const __half *input,
   dim3 grid(CEILDIV(N, BLOCK_N_SM), M);
   size_t smem = (K + CEILDIV(K, WARP_SIZE)) * sizeof(float);
   auto kernel = nvfp4_gemm::nvfp4_matmul_smallm_kernel<half>;
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+  if (smem > 48 * 1024) {
+    cudaError_t status = cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (status != cudaSuccess) return status;
+  }
   kernel<<<grid, block, smem, stream>>>(input, weight, weight_scale,
                                         weight_global_scale, bias, output, M, N,
                                         K, has_bias, force_lut);
+  return cudaPeekAtLastError();
 }
 
 #ifndef NO_BF16_KERNEL
-extern "C" void nvfp4_matmul_smallm_bf16(const __nv_bfloat16 *input,
+extern "C" cudaError_t nvfp4_matmul_smallm_bf16(const __nv_bfloat16 *input,
                                           const uint8_t *weight,
                                           const uint8_t *weight_scale,
                                           float weight_global_scale,
@@ -954,16 +959,23 @@ extern "C" void nvfp4_matmul_smallm_bf16(const __nv_bfloat16 *input,
   dim3 grid(CEILDIV(N, BLOCK_N_SM), M);
   size_t smem = (K + CEILDIV(K, WARP_SIZE)) * sizeof(float);
   auto kernel = nvfp4_gemm::nvfp4_matmul_smallm_kernel<__nv_bfloat16>;
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+  if (smem > 48 * 1024) {
+    cudaError_t status = cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (status != cudaSuccess) return status;
+  }
   kernel<<<grid, block, smem, stream>>>(input, weight, weight_scale,
                                         weight_global_scale, bias, output, M, N,
                                         K, has_bias, force_lut);
+  return cudaPeekAtLastError();
 }
 #else
-extern "C" void nvfp4_matmul_smallm_bf16(const void *, const uint8_t *,
+extern "C" cudaError_t nvfp4_matmul_smallm_bf16(const void *, const uint8_t *,
                                           const uint8_t *, float, const void *,
                                           void *, int, int, int, bool, bool,
-                                          cudaStream_t) {}
+                                          cudaStream_t) {
+  return cudaErrorNotSupported;
+}
 #endif
 
 extern "C" void nvfp4_matmul_f16(const __half *input, const uint8_t *weight,
