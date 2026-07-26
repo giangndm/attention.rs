@@ -280,6 +280,161 @@ pub fn flash_prefill(
 pub const SPLIT_K_THRESHOLD: usize = 1024;
 pub const NUM_SPLITS: u32 = 16;
 pub const TQ_NUM_SPLITS: u32 = 16;
+const SHORT_CONTEXT_SPLIT_K_THRESHOLD: usize = 128;
+const SHORT_CONTEXT_NUM_SPLITS: u32 = 4;
+const SHORT_CONTEXT_MIN_NATIVE_WORK_ITEMS: usize = 128;
+
+/// Chooses the regular decode Split-K layout without changing TurboQuant paths.
+fn split_k_plan(
+    max_context_len: usize,
+    decode_work_items: usize,
+    has_workspace: bool,
+) -> Option<u32> {
+    if !has_workspace {
+        None
+    } else if max_context_len >= SPLIT_K_THRESHOLD {
+        Some(NUM_SPLITS)
+    } else if max_context_len >= SHORT_CONTEXT_SPLIT_K_THRESHOLD
+        && decode_work_items < SHORT_CONTEXT_MIN_NATIVE_WORK_ITEMS
+    {
+        Some(SHORT_CONTEXT_NUM_SPLITS)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod split_k_policy_tests {
+    use super::{flash_decode, split_k_plan, NUM_SPLITS};
+    #[cfg(feature = "cuda")]
+    use candle_core::{DType, Device, Result, Tensor};
+
+    #[test]
+    fn split_k_plan_fills_short_context_sms_only_with_workspace() {
+        assert_eq!(split_k_plan(127, 64, true), None);
+        assert_eq!(split_k_plan(128, 64, true), Some(4));
+        assert_eq!(split_k_plan(1023, 64, true), Some(4));
+        assert_eq!(split_k_plan(128, 128, true), None);
+        assert_eq!(split_k_plan(1024, 192, true), Some(16));
+        assert_eq!(split_k_plan(256, 64, false), None);
+    }
+
+    #[cfg(feature = "cuda")]
+    fn assert_short_context_split_k_matches_native(fp8_cache: bool) -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let num_q_heads = 64;
+        let num_kv_heads = 8;
+        let head_dim = 128;
+        let context_len = 128;
+        let block_size = 32;
+        let num_blocks = context_len / block_size;
+        let query = Tensor::randn(0f32, 1f32, (1, num_q_heads, head_dim), &device)?
+            .to_dtype(DType::BF16)?;
+        let key_bf16 = Tensor::randn(
+            0f32,
+            1f32,
+            (num_blocks, block_size, num_kv_heads, head_dim),
+            &device,
+        )?
+        .to_dtype(DType::BF16)?;
+        let value_bf16 = Tensor::randn(
+            0f32,
+            1f32,
+            (num_blocks, block_size, num_kv_heads, head_dim),
+            &device,
+        )?
+        .to_dtype(DType::BF16)?;
+        let (key_cache, k_scale) = if fp8_cache {
+            crate::convert_to_fp8(&key_bf16, None)?
+        } else {
+            (key_bf16, Tensor::zeros(num_kv_heads, DType::F32, &device)?)
+        };
+        let (value_cache, v_scale) = if fp8_cache {
+            crate::convert_to_fp8(&value_bf16, None)?
+        } else {
+            (
+                value_bf16,
+                Tensor::zeros(num_kv_heads, DType::F32, &device)?,
+            )
+        };
+        let block_tables = Tensor::from_vec(
+            (0..num_blocks as u32).collect::<Vec<_>>(),
+            (1, num_blocks),
+            &device,
+        )?;
+        let context_lens = Tensor::from_vec(vec![context_len as u32], 1, &device)?;
+        let native = Tensor::zeros((1, num_q_heads, head_dim), DType::BF16, &device)?;
+        let split = Tensor::zeros((1, num_q_heads, head_dim), DType::BF16, &device)?;
+        let workspace = Tensor::zeros(
+            (num_q_heads * NUM_SPLITS as usize * (head_dim + 2),),
+            DType::F32,
+            &device,
+        )?;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        flash_decode(
+            &query,
+            &key_cache,
+            &value_cache,
+            &block_tables,
+            &context_lens,
+            &native,
+            context_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            0.0,
+            None,
+            fp8_cache.then_some(&k_scale),
+            fp8_cache.then_some(&v_scale),
+            None,
+        )?;
+        flash_decode(
+            &query,
+            &key_cache,
+            &value_cache,
+            &block_tables,
+            &context_lens,
+            &split,
+            context_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            0.0,
+            None,
+            fp8_cache.then_some(&k_scale),
+            fp8_cache.then_some(&v_scale),
+            Some(&workspace),
+        )?;
+        device.synchronize()?;
+
+        let native = native
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let split = split
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for (native, split) in native.into_iter().zip(split) {
+            assert!(native.is_finite() && split.is_finite());
+            assert!(
+                (native - split).abs() <= 0.02,
+                "native={native}, split={split}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn short_context_split_k_matches_native_for_bf16_and_fp8() -> Result<()> {
+        assert_short_context_split_k_matches_native(false)?;
+        assert_short_context_split_k_matches_native(true)
+    }
+}
 
 #[cfg(feature = "cuda")]
 pub fn flash_decode(
@@ -335,7 +490,11 @@ pub fn flash_decode(
     let max_blocks_per_seq = block_tables.dim(1)? as u32;
     let sw = sliding_window.unwrap_or(0) as u32;
     let is_fp8 = key_cache.dtype() == DType::U8;
-    let use_splitk = max_context_len >= SPLIT_K_THRESHOLD && workspace.is_some();
+    let split_k_splits = split_k_plan(
+        max_context_len,
+        num_seqs.saturating_mul(num_q_heads),
+        workspace.is_some(),
+    );
 
     // GQA disabled for native flash path: shared memory overflow at higher ratios
     // (e.g. GQA=8 with HDIM=256 needs 64KB smem, exceeding 48KB limit).
@@ -347,7 +506,7 @@ pub fn flash_decode(
         let ks_ptr = scale_gpu_ptr(k_scale)?;
         let vs_ptr = scale_gpu_ptr(v_scale)?;
 
-        if use_splitk {
+        if let Some(num_splits) = split_k_splits {
             let ws = workspace.unwrap();
             let ws_ptr = ptr_from_tensor(ws)? as *mut std::ffi::c_void;
             unsafe {
@@ -365,7 +524,7 @@ pub fn flash_decode(
                     block_size as u32,
                     scale,
                     num_seqs as u32,
-                    NUM_SPLITS,
+                    num_splits,
                     q_stride,
                     softcap,
                     ks_ptr,
@@ -380,7 +539,7 @@ pub fn flash_decode(
                     o_ptr,
                     num_q_heads as u32,
                     head_dim as u32,
-                    NUM_SPLITS,
+                    num_splits,
                     num_seqs as u32,
                     stream,
                 );
@@ -413,7 +572,7 @@ pub fn flash_decode(
             }
         }
     } else {
-        if use_splitk {
+        if let Some(num_splits) = split_k_splits {
             let ws = workspace.unwrap();
             let ws_ptr = ptr_from_tensor(ws)? as *mut std::ffi::c_void;
             unsafe {
@@ -431,7 +590,7 @@ pub fn flash_decode(
                     block_size as u32,
                     scale,
                     num_seqs as u32,
-                    NUM_SPLITS,
+                    num_splits,
                     q_stride,
                     softcap,
                     sw,
@@ -443,7 +602,7 @@ pub fn flash_decode(
                     o_ptr,
                     num_q_heads as u32,
                     head_dim as u32,
-                    NUM_SPLITS,
+                    num_splits,
                     num_seqs as u32,
                     stream,
                 );
