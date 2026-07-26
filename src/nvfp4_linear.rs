@@ -30,6 +30,19 @@ enum GroupedDecodeKernel {
     Fallback(DecodeKernel),
 }
 
+/// Selects the hardware-FP4 path once small-M decode no longer owns routing.
+///
+/// Rows one through three retain the small-M policy. Four or more rows use
+/// the native hardware kernel when it is available, instead of the small-M
+/// or software-WMMA route.
+fn should_use_hardware_fp4(
+    is_prefill: bool,
+    m: usize,
+    decode_kernel: Option<DecodeKernel>,
+) -> bool {
+    is_prefill || m >= 4 || decode_kernel == Some(DecodeKernel::HardwareFp4)
+}
+
 /// Dynamic shared memory requested by the small-M CUDA kernel.
 ///
 /// The kernel stores `K` dequantized values with one padding slot per warp-sized
@@ -624,7 +637,7 @@ pub fn nvfp4_matmul(
 
             let use_hardware_fp4 = !use_flashinfer_fp4
                 && hardware_fp4_available
-                && (is_prefill || decode_kernel == Some(DecodeKernel::HardwareFp4));
+                && should_use_hardware_fp4(is_prefill, m, decode_kernel);
 
             let output = Tensor::zeros((m, n), dtype, dev)?;
             let has_bias = bias.is_some();
@@ -1215,8 +1228,9 @@ mod tests {
     use super::{
         cuda_dimension, cuda_launch_status, grouped_smallm_shared_memory_bytes,
         grouped_smallm_tiled_shared_memory_bytes, select_decode_kernel,
-        select_grouped_decode_kernel, smallm_shared_memory_bytes, smallm_tiled_shared_memory_bytes,
-        DecodeKernel, GroupedDecodeKernel, NVFP4_BLOCK_SIZE, SMALLM_TILE_K,
+        select_grouped_decode_kernel, should_use_hardware_fp4, smallm_shared_memory_bytes,
+        smallm_tiled_shared_memory_bytes, DecodeKernel, GroupedDecodeKernel, NVFP4_BLOCK_SIZE,
+        SMALLM_TILE_K,
     };
     #[cfg(feature = "cuda")]
     use candle_core::cuda_backend::cudarc::driver::DevicePtr;
@@ -1313,6 +1327,42 @@ mod tests {
         );
         assert!(select_grouped_decode_kernel(1, 5_120, 17, 101_376, false).is_err());
         assert!(select_grouped_decode_kernel(5, 5_120, 17, 101_376, false).is_err());
+    }
+
+    #[test]
+    fn hardware_fp4_owns_decode_from_four_rows() {
+        assert!(!should_use_hardware_fp4(
+            false,
+            3,
+            Some(DecodeKernel::SmallM)
+        ));
+        assert!(!should_use_hardware_fp4(
+            false,
+            3,
+            Some(DecodeKernel::SmallMTiled)
+        ));
+        assert!(should_use_hardware_fp4(
+            false,
+            4,
+            Some(DecodeKernel::SmallM)
+        ));
+        assert!(should_use_hardware_fp4(
+            false,
+            31,
+            Some(DecodeKernel::SmallMTiled)
+        ));
+        assert!(should_use_hardware_fp4(false, 32, None));
+        assert!(should_use_hardware_fp4(true, 16, None));
+        assert!(should_use_hardware_fp4(
+            false,
+            1,
+            Some(DecodeKernel::HardwareFp4)
+        ));
+        assert!(!should_use_hardware_fp4(
+            false,
+            1,
+            Some(DecodeKernel::SmallM)
+        ));
     }
 
     #[test]
