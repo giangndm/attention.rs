@@ -1,6 +1,24 @@
 use core::ffi::{c_int, c_long, c_void};
 #[allow(dead_code)]
 extern "C" {
+    pub fn qk_rmsnorm_rope_bf16(
+        qkv: *const c_void,
+        q_weight: *const f32,
+        k_weight: *const f32,
+        cos: *const f32,
+        sin: *const f32,
+        positions: *const i64,
+        q_output: *mut c_void,
+        k_output: *mut c_void,
+        tokens: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        row_width: u32,
+        max_position: u32,
+        eps: f32,
+        stream: i64,
+    ) -> c_int;
+
     pub fn call_reshape_and_cache(
         key: *const c_void,
         value: *const c_void,
