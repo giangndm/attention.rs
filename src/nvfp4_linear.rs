@@ -12,18 +12,20 @@ use candle_core::{Result, Tensor};
 
 pub const NVFP4_BLOCK_SIZE: usize = 16;
 const WARP_SIZE: usize = 32;
+const SMALLM_TILE_K: usize = 8_192;
 
 /// Kernel selected for single-token NVFP4 decode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DecodeKernel {
     SmallM,
+    SmallMTiled,
     HardwareFp4,
 }
 
 /// Dynamic shared memory requested by the small-M CUDA kernel.
 ///
-/// The kernel stores `K` dequantized values plus one partial sum per warp,
-/// all as `f32` values.
+/// The kernel stores `K` dequantized values with one padding slot per warp-sized
+/// span, all as `f32` values.
 fn smallm_shared_memory_bytes(k: usize) -> Result<usize> {
     let warp_count = k
         .checked_add(WARP_SIZE - 1)
@@ -32,6 +34,11 @@ fn smallm_shared_memory_bytes(k: usize) -> Result<usize> {
     k.checked_add(warp_count)
         .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
         .ok_or_else(|| candle_core::Error::Msg("small-M shared-memory size overflow".into()))
+}
+
+/// Dynamic shared memory requested by the fixed-K tiled small-M kernel.
+fn smallm_tiled_shared_memory_bytes(k: usize) -> Result<usize> {
+    smallm_shared_memory_bytes(k.min(SMALLM_TILE_K))
 }
 
 /// Select a safe decode kernel from dimensions and device capabilities only.
@@ -46,13 +53,19 @@ fn select_decode_kernel(
         return Ok(DecodeKernel::SmallM);
     }
 
+    let tiled_shared_memory_bytes = smallm_tiled_shared_memory_bytes(k)?;
+    if tiled_shared_memory_bytes <= max_shared_memory_bytes {
+        return Ok(DecodeKernel::SmallMTiled);
+    }
+
     if hardware_fp4_available && k % 32 == 0 && n % 32 == 0 {
         return Ok(DecodeKernel::HardwareFp4);
     }
 
     candle_core::bail!(
         "NVFP4 small-M decode requires {required_shared_memory_bytes} bytes of shared memory, \
-         but the device limit is {max_shared_memory_bytes} bytes and hardware FP4 fallback unavailable \
+         tiled route requires {tiled_shared_memory_bytes} bytes, but the device limit is \
+         {max_shared_memory_bytes} bytes and hardware FP4 fallback unavailable \
          for K={k}, N={n}"
     )
 }
@@ -645,41 +658,85 @@ pub fn nvfp4_matmul(
 
                 unsafe {
                     if m < 32 {
-                        let status = match dtype {
-                            DType::F16 => ffi::nvfp4_matmul_smallm_f16(
-                                input_ptr,
-                                weight_ptr,
-                                scale_ptr,
-                                weight_global_scale,
-                                bias_ptr,
-                                output_ptr,
-                                m as i32,
-                                n as i32,
-                                k as i32,
-                                has_bias,
-                                force_lut,
-                                stream,
+                        let status = match (decode_kernel, dtype) {
+                            (Some(DecodeKernel::SmallMTiled), DType::F16) => {
+                                ffi::nvfp4_matmul_smallm_tiled_f16(
+                                    input_ptr,
+                                    weight_ptr,
+                                    scale_ptr,
+                                    weight_global_scale,
+                                    bias_ptr,
+                                    output_ptr,
+                                    m as i32,
+                                    n as i32,
+                                    k as i32,
+                                    has_bias,
+                                    force_lut,
+                                    stream,
+                                )
+                            }
+                            (Some(DecodeKernel::SmallMTiled), DType::BF16) => {
+                                ffi::nvfp4_matmul_smallm_tiled_bf16(
+                                    input_ptr,
+                                    weight_ptr,
+                                    scale_ptr,
+                                    weight_global_scale,
+                                    bias_ptr,
+                                    output_ptr,
+                                    m as i32,
+                                    n as i32,
+                                    k as i32,
+                                    has_bias,
+                                    force_lut,
+                                    stream,
+                                )
+                            }
+                            (Some(DecodeKernel::SmallM) | None, DType::F16) => {
+                                ffi::nvfp4_matmul_smallm_f16(
+                                    input_ptr,
+                                    weight_ptr,
+                                    scale_ptr,
+                                    weight_global_scale,
+                                    bias_ptr,
+                                    output_ptr,
+                                    m as i32,
+                                    n as i32,
+                                    k as i32,
+                                    has_bias,
+                                    force_lut,
+                                    stream,
+                                )
+                            }
+                            (Some(DecodeKernel::SmallM) | None, DType::BF16) => {
+                                ffi::nvfp4_matmul_smallm_bf16(
+                                    input_ptr,
+                                    weight_ptr,
+                                    scale_ptr,
+                                    weight_global_scale,
+                                    bias_ptr,
+                                    output_ptr,
+                                    m as i32,
+                                    n as i32,
+                                    k as i32,
+                                    has_bias,
+                                    force_lut,
+                                    stream,
+                                )
+                            }
+                            (Some(DecodeKernel::HardwareFp4), _) => candle_core::bail!(
+                                "nvfp4_matmul CUDA: hardware FP4 decode reached software path"
                             ),
-                            DType::BF16 => ffi::nvfp4_matmul_smallm_bf16(
-                                input_ptr,
-                                weight_ptr,
-                                scale_ptr,
-                                weight_global_scale,
-                                bias_ptr,
-                                output_ptr,
-                                m as i32,
-                                n as i32,
-                                k as i32,
-                                has_bias,
-                                force_lut,
-                                stream,
-                            ),
-                            _ => candle_core::bail!(
+                            (_, _) => candle_core::bail!(
                                 "nvfp4_matmul CUDA: unsupported dtype {:?}",
                                 dtype
                             ),
                         };
-                        cuda_launch_status(status, "NVFP4 small-M")?;
+                        let kernel_name = if decode_kernel == Some(DecodeKernel::SmallMTiled) {
+                            "NVFP4 tiled small-M"
+                        } else {
+                            "NVFP4 small-M"
+                        };
+                        cuda_launch_status(status, kernel_name)?;
                     } else {
                         match dtype {
                             DType::F16 => {
@@ -899,8 +956,13 @@ pub fn mlx_repack_u32_to_u8(weight_u32: &Tensor) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cuda_launch_status, select_decode_kernel, smallm_shared_memory_bytes, DecodeKernel,
+        cuda_launch_status, select_decode_kernel, smallm_shared_memory_bytes,
+        smallm_tiled_shared_memory_bytes, DecodeKernel, NVFP4_BLOCK_SIZE, SMALLM_TILE_K,
     };
+    #[cfg(feature = "cuda")]
+    use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+    #[cfg(feature = "cuda")]
+    use candle_core::{DType, Device, Storage, Tensor};
 
     const RTX_5090_MAX_OPTIN_SHARED_MEMORY: usize = 101_376;
 
@@ -919,25 +981,47 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_hardware_when_smallm_exceeds_device_limit() {
+    fn full_smallm_remains_preferred_when_both_routes_fit() {
+        assert_eq!(
+            select_decode_kernel(8_192, 8_192, RTX_5090_MAX_OPTIN_SHARED_MEMORY, true).unwrap(),
+            DecodeKernel::SmallM
+        );
+    }
+
+    #[test]
+    fn tiled_shared_memory_matches_fixed_tile_layout() {
+        assert_eq!(SMALLM_TILE_K, 8_192);
+        assert_eq!(smallm_tiled_shared_memory_bytes(25_600).unwrap(), 33_792);
+    }
+
+    #[test]
+    fn selects_tiled_smallm_when_full_exceeds_device_limit() {
         assert_eq!(
             select_decode_kernel(25_600, 5_120, RTX_5090_MAX_OPTIN_SHARED_MEMORY, true).unwrap(),
+            DecodeKernel::SmallMTiled
+        );
+    }
+
+    #[test]
+    fn falls_back_to_hardware_when_fixed_tile_exceeds_device_limit() {
+        assert_eq!(
+            select_decode_kernel(25_600, 5_120, 33_791, true).unwrap(),
             DecodeKernel::HardwareFp4
         );
     }
 
     #[test]
-    fn rejects_unsafe_smallm_without_hardware_fallback() {
-        let err = select_decode_kernel(25_600, 5_120, RTX_5090_MAX_OPTIN_SHARED_MEMORY, false)
-            .unwrap_err();
+    fn rejects_decode_when_neither_smallm_route_nor_hardware_fits() {
+        let err = select_decode_kernel(25_600, 5_120, 33_791, false).unwrap_err();
 
         assert!(err.to_string().contains("requires 105600 bytes"));
-        assert!(err.to_string().contains("device limit is 101376 bytes"));
+        assert!(err.to_string().contains("tiled route requires 33792 bytes"));
+        assert!(err.to_string().contains("device limit is 33791 bytes"));
     }
 
     #[test]
     fn rejects_hardware_fallback_for_unaligned_dimensions() {
-        let err = select_decode_kernel(25_600, 5_121, 101_376, true).unwrap_err();
+        let err = select_decode_kernel(25_600, 5_121, 33_791, true).unwrap_err();
 
         assert!(err
             .to_string()
@@ -956,6 +1040,105 @@ mod tests {
 
         assert!(err.to_string().contains("small-M BF16"));
         assert!(err.to_string().contains("CUDA error 9"));
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_ptr(tensor: &Tensor) -> candle_core::Result<u64> {
+        let (storage, _) = tensor.storage_and_layout();
+        match (&*storage, tensor.dtype()) {
+            (Storage::Cuda(storage), DType::F16) => {
+                Ok(*storage.as_cuda_slice::<half::f16>()?.device_ptr())
+            }
+            (Storage::Cuda(storage), DType::BF16) => {
+                Ok(*storage.as_cuda_slice::<half::bf16>()?.device_ptr())
+            }
+            (Storage::Cuda(storage), DType::U8) => Ok(*storage.as_cuda_slice::<u8>()?.device_ptr()),
+            _ => candle_core::bail!("GPU equivalence fixture must use CUDA F16/BF16/U8 tensors"),
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn tiled_smallm_matches_full_smallm_on_gpu() -> candle_core::Result<()> {
+        const M: usize = 1;
+        const N: usize = 17;
+        const K: usize = 17_424;
+
+        let dev = match Device::new_cuda(0) {
+            Ok(dev) => dev,
+            Err(_) => return Ok(()),
+        };
+        let cuda_dev = dev.as_cuda_device()?;
+        if super::max_optin_shared_memory_bytes(cuda_dev)? < smallm_shared_memory_bytes(K)? {
+            return Ok(());
+        }
+
+        let input_values = (0..M * K)
+            .map(|i| ((i % 31) as f32 - 15.0) / 64.0)
+            .collect::<Vec<_>>();
+        let weight_values = (0..N * (K / 2))
+            .map(|i| i.wrapping_mul(37).wrapping_add(11) as u8)
+            .collect::<Vec<_>>();
+        let scale_values = (0..N * (K / NVFP4_BLOCK_SIZE))
+            .map(|i| if i % 2 == 0 { 0x20_u8 } else { 0x28_u8 })
+            .collect::<Vec<_>>();
+        let bias_values = (0..N).map(|i| (i as f32 - 8.0) / 16.0).collect::<Vec<_>>();
+
+        let weight = Tensor::from_vec(weight_values, (N, K / 2), &dev)?;
+        let scale = Tensor::from_vec(scale_values, (N, K / NVFP4_BLOCK_SIZE), &dev)?;
+        let weight_ptr = cuda_ptr(&weight)? as *const u8;
+        let scale_ptr = cuda_ptr(&scale)? as *const u8;
+        let stream = *cuda_dev.cu_stream() as i64;
+
+        for dtype in [DType::F16, DType::BF16] {
+            let input = Tensor::from_vec(input_values.clone(), (M, K), &dev)?.to_dtype(dtype)?;
+            let bias = Tensor::from_vec(bias_values.clone(), (N,), &dev)?.to_dtype(dtype)?;
+            let input_ptr = cuda_ptr(&input)? as *const std::ffi::c_void;
+            let bias_ptr = cuda_ptr(&bias)? as *const std::ffi::c_void;
+
+            for force_lut in [false, true] {
+                let full = Tensor::zeros((M, N), dtype, &dev)?;
+                let tiled = Tensor::zeros((M, N), dtype, &dev)?;
+                let full_ptr = cuda_ptr(&full)? as *mut std::ffi::c_void;
+                let tiled_ptr = cuda_ptr(&tiled)? as *mut std::ffi::c_void;
+
+                let (full_status, tiled_status) = unsafe {
+                    match dtype {
+                        DType::F16 => (
+                            crate::kernels::ffi::nvfp4_matmul_smallm_f16(
+                                input_ptr, weight_ptr, scale_ptr, 0.25, bias_ptr, full_ptr,
+                                M as i32, N as i32, K as i32, true, force_lut, stream,
+                            ),
+                            crate::kernels::ffi::nvfp4_matmul_smallm_tiled_f16(
+                                input_ptr, weight_ptr, scale_ptr, 0.25, bias_ptr, tiled_ptr,
+                                M as i32, N as i32, K as i32, true, force_lut, stream,
+                            ),
+                        ),
+                        DType::BF16 => (
+                            crate::kernels::ffi::nvfp4_matmul_smallm_bf16(
+                                input_ptr, weight_ptr, scale_ptr, 0.25, bias_ptr, full_ptr,
+                                M as i32, N as i32, K as i32, true, force_lut, stream,
+                            ),
+                            crate::kernels::ffi::nvfp4_matmul_smallm_tiled_bf16(
+                                input_ptr, weight_ptr, scale_ptr, 0.25, bias_ptr, tiled_ptr,
+                                M as i32, N as i32, K as i32, true, force_lut, stream,
+                            ),
+                        ),
+                        _ => unreachable!("fixture only covers F16 and BF16"),
+                    }
+                };
+                cuda_launch_status(full_status, "NVFP4 full small-M equivalence")?;
+                cuda_launch_status(tiled_status, "NVFP4 tiled small-M equivalence")?;
+
+                assert_eq!(
+                    full.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+                    tiled.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+                    "dtype={dtype:?}, force_lut={force_lut}"
+                );
+            }
+        }
+
+        Ok(())
     }
 }
 

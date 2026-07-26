@@ -415,6 +415,218 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
   }
 }
 
+// Fixed-K streaming variant of the small-M kernel. TILE_K is a multiple of the
+// 1024-element per-lane visitation stride, so every lane accumulates global K
+// values in the same order as nvfp4_matmul_smallm_kernel.
+constexpr int SMALLM_TILE_K = 8192;
+static_assert(SMALLM_TILE_K % (WARP_SIZE * 2 * NVFP4_BLOCK_SIZE) == 0,
+              "small-M tile must preserve lane visitation order");
+
+template <typename T>
+__launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
+    void nvfp4_matmul_smallm_tiled_kernel(
+        const T *__restrict__ input, const uint8_t *__restrict__ weight,
+        const uint8_t *__restrict__ weight_scale, float weight_global_scale,
+        const T *__restrict__ bias, T *__restrict__ output, int M, int N, int K,
+        bool has_bias, bool force_lut) {
+  extern __shared__ float s_input[];
+
+  const uint32_t LUT0 = 0x03020100;
+  const uint32_t LUT1 = 0x0C080604;
+  const uint32_t LUT2 = 0xFDFEFF00;
+  const uint32_t LUT3 = 0xF4F8FAFC;
+
+  const int tid = threadIdx.x;
+  const int block_size = blockDim.x;
+  const int warp_id = tid / WARP_SIZE;
+  const int lane_id = tid % WARP_SIZE;
+  const int row = blockIdx.y;
+  const int n_idx = blockIdx.x * BLOCK_N_SM + warp_id;
+  const int weight_row_stride = K / 2;
+  const int scale_stride = CEILDIV(K, NVFP4_BLOCK_SIZE);
+  const bool active_output = n_idx < N;
+
+  if (row >= M)
+    return;
+
+  const T *in_row = input + (size_t)row * K;
+  const uint8_t *w_row =
+      active_output ? weight + (size_t)n_idx * weight_row_stride : nullptr;
+  const uint8_t *w_scale_row =
+      active_output ? weight_scale + (size_t)n_idx * scale_stride : nullptr;
+  float acc = 0.0f;
+
+  constexpr int ELEMS_PER_VEC = 8;
+  constexpr int ELEMS_PER_LANE = 2 * NVFP4_BLOCK_SIZE;
+  for (int tile_base = 0; tile_base < K; tile_base += SMALLM_TILE_K) {
+    const int tile_k = min(SMALLM_TILE_K, K - tile_base);
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+    for (int local_k = tid; local_k < tile_k; local_k += block_size) {
+      const int smem_idx = local_k + local_k / WARP_SIZE;
+      if constexpr (std::is_same_v<T, half>) {
+        s_input[smem_idx] = __half2float(__ldg(&in_row[tile_base + local_k]));
+      } else {
+        s_input[smem_idx] =
+            __bfloat162float(__ldg(&in_row[tile_base + local_k]));
+      }
+    }
+#else
+    const int tile_vecs = tile_k / ELEMS_PER_VEC;
+    const float4 *in_vec =
+        reinterpret_cast<const float4 *>(in_row + tile_base);
+    for (int vi = tid; vi < tile_vecs; vi += block_size) {
+      const float4 v = __ldg(&in_vec[vi]);
+      const T *elems = reinterpret_cast<const T *>(&v);
+      const int base = vi * ELEMS_PER_VEC;
+#pragma unroll
+      for (int j = 0; j < ELEMS_PER_VEC; ++j) {
+        const int local_k = base + j;
+        const int smem_idx = local_k + local_k / WARP_SIZE;
+        if constexpr (std::is_same_v<T, half>) {
+          s_input[smem_idx] = __half2float(elems[j]);
+        } else {
+          s_input[smem_idx] = __bfloat162float(elems[j]);
+        }
+      }
+    }
+#endif
+    __syncthreads();
+
+    if (active_output) {
+      for (int local_k = lane_id * ELEMS_PER_LANE; local_k < tile_k;
+           local_k += WARP_SIZE * ELEMS_PER_LANE) {
+        const int k = tile_base + local_k;
+
+#ifdef NVFP4_HW_DEQUANT
+        if (!force_lut) {
+          const int local_k2 = local_k + NVFP4_BLOCK_SIZE;
+          const int k2 = k + NVFP4_BLOCK_SIZE;
+          if (local_k2 < tile_k) {
+            const uint16_t raw_scales = load_uint16_safe(
+                w_scale_row + k / NVFP4_BLOCK_SIZE);
+            const float2 block_scales = fp8x2_scale_to_float2(raw_scales);
+            const uint2 w_vec =
+                __ldg(reinterpret_cast<const uint2 *>(w_row + k / 2));
+            const uint2 w_vec2 =
+                __ldg(reinterpret_cast<const uint2 *>(w_row + k2 / 2));
+            acc += hw_dot_16(
+                w_vec, block_scales.x * weight_global_scale,
+                s_input + local_k + local_k / WARP_SIZE);
+            acc += hw_dot_16(
+                w_vec2, block_scales.y * weight_global_scale,
+                s_input + local_k2 + local_k2 / WARP_SIZE);
+          } else {
+            const float block_scale = fp8_scale_to_float(
+                                          __ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
+                                      weight_global_scale;
+            const uint2 w_vec =
+                __ldg(reinterpret_cast<const uint2 *>(w_row + k / 2));
+            acc += hw_dot_16(w_vec, block_scale,
+                             s_input + local_k + local_k / WARP_SIZE);
+          }
+        } else
+#endif
+        {
+          const float block_scale =
+              dispatch_fp8_to_float(
+                  __ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
+              weight_global_scale * 0.5f;
+          const uint2 w_vec = load_uint2_safe(w_row + k / 2);
+          const float *in = s_input + local_k + local_k / WARP_SIZE;
+
+          float partial = 0.0f;
+          const int2 w0 =
+              get_int_from_table_16(w_vec.x, LUT0, LUT1, LUT2, LUT3);
+          partial = fmaf(in[0], (float)(int8_t)(w0.x), partial);
+          partial = fmaf(in[1], (float)(int8_t)(w0.y), partial);
+          partial = fmaf(in[2], (float)(int8_t)(w0.x >> 8), partial);
+          partial = fmaf(in[3], (float)(int8_t)(w0.y >> 8), partial);
+          partial = fmaf(in[4], (float)(int8_t)(w0.x >> 16), partial);
+          partial = fmaf(in[5], (float)(int8_t)(w0.y >> 16), partial);
+          partial = fmaf(in[6], (float)(int8_t)(w0.x >> 24), partial);
+          partial = fmaf(in[7], (float)(int8_t)(w0.y >> 24), partial);
+
+          const int2 w1 =
+              get_int_from_table_16(w_vec.y, LUT0, LUT1, LUT2, LUT3);
+          partial = fmaf(in[8], (float)(int8_t)(w1.x), partial);
+          partial = fmaf(in[9], (float)(int8_t)(w1.y), partial);
+          partial = fmaf(in[10], (float)(int8_t)(w1.x >> 8), partial);
+          partial = fmaf(in[11], (float)(int8_t)(w1.y >> 8), partial);
+          partial = fmaf(in[12], (float)(int8_t)(w1.x >> 16), partial);
+          partial = fmaf(in[13], (float)(int8_t)(w1.y >> 16), partial);
+          partial = fmaf(in[14], (float)(int8_t)(w1.x >> 24), partial);
+          partial = fmaf(in[15], (float)(int8_t)(w1.y >> 24), partial);
+          acc = fmaf(partial, block_scale, acc);
+
+          const int local_k2 = local_k + NVFP4_BLOCK_SIZE;
+          if (local_k2 < tile_k) {
+            const int k2 = k + NVFP4_BLOCK_SIZE;
+            const float block_scale2 =
+                dispatch_fp8_to_float(
+                    __ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
+                weight_global_scale * 0.5f;
+            const uint2 w_vec2 = load_uint2_safe(w_row + k2 / 2);
+            const float *in2 =
+                s_input + local_k2 + local_k2 / WARP_SIZE;
+
+            float partial2 = 0.0f;
+            const int2 w2a =
+                get_int_from_table_16(w_vec2.x, LUT0, LUT1, LUT2, LUT3);
+            partial2 = fmaf(in2[0], (float)(int8_t)(w2a.x), partial2);
+            partial2 = fmaf(in2[1], (float)(int8_t)(w2a.y), partial2);
+            partial2 = fmaf(in2[2], (float)(int8_t)(w2a.x >> 8), partial2);
+            partial2 = fmaf(in2[3], (float)(int8_t)(w2a.y >> 8), partial2);
+            partial2 = fmaf(in2[4], (float)(int8_t)(w2a.x >> 16), partial2);
+            partial2 = fmaf(in2[5], (float)(int8_t)(w2a.y >> 16), partial2);
+            partial2 = fmaf(in2[6], (float)(int8_t)(w2a.x >> 24), partial2);
+            partial2 = fmaf(in2[7], (float)(int8_t)(w2a.y >> 24), partial2);
+
+            const int2 w2b =
+                get_int_from_table_16(w_vec2.y, LUT0, LUT1, LUT2, LUT3);
+            partial2 = fmaf(in2[8], (float)(int8_t)(w2b.x), partial2);
+            partial2 = fmaf(in2[9], (float)(int8_t)(w2b.y), partial2);
+            partial2 = fmaf(in2[10], (float)(int8_t)(w2b.x >> 8), partial2);
+            partial2 = fmaf(in2[11], (float)(int8_t)(w2b.y >> 8), partial2);
+            partial2 = fmaf(in2[12], (float)(int8_t)(w2b.x >> 16), partial2);
+            partial2 = fmaf(in2[13], (float)(int8_t)(w2b.y >> 16), partial2);
+            partial2 = fmaf(in2[14], (float)(int8_t)(w2b.x >> 24), partial2);
+            partial2 = fmaf(in2[15], (float)(int8_t)(w2b.y >> 24), partial2);
+            acc = fmaf(partial2, block_scale2, acc);
+          }
+        }
+      }
+    }
+
+    // All warps, including inactive tail-N warps, must finish reading this tile
+    // before the cooperative load overwrites shared memory.
+    __syncthreads();
+  }
+
+  if (!active_output)
+    return;
+
+#pragma unroll
+  for (int offset = 16; offset > 0; offset /= 2) {
+    acc += __shfl_down_sync(0xffffffff, acc, offset);
+  }
+
+  if (lane_id == 0) {
+    if (has_bias && bias != nullptr) {
+      if constexpr (std::is_same_v<T, half>) {
+        acc += __half2float(__ldg(&bias[n_idx]));
+      } else {
+        acc += __bfloat162float(__ldg(&bias[n_idx]));
+      }
+    }
+    if constexpr (std::is_same_v<T, half>) {
+      output[(size_t)row * N + n_idx] = __float2half(acc);
+    } else {
+      output[(size_t)row * N + n_idx] = __float2bfloat16_rn(acc);
+    }
+  }
+}
+
 // Tiled matmul for larger M: NVFP4 version
 template <typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int TM, int TN>
 __global__ void nvfp4_matmul_tiled(const T *__restrict__ input,
@@ -960,6 +1172,30 @@ extern "C" cudaError_t nvfp4_matmul_smallm_f16(const __half *input,
   return cudaPeekAtLastError();
 }
 
+extern "C" cudaError_t nvfp4_matmul_smallm_tiled_f16(
+    const __half *input, const uint8_t *weight, const uint8_t *weight_scale,
+    float weight_global_scale, const __half *bias, __half *output, int M, int N,
+    int K, bool has_bias, bool force_lut, cudaStream_t stream) {
+  using namespace nvfp4_gemm;
+  constexpr int THREADS = BLOCK_N_SM * WARP_SIZE;
+  dim3 block(THREADS);
+  dim3 grid(CEILDIV(N, BLOCK_N_SM), M);
+  const int tile_k = K < SMALLM_TILE_K ? K : SMALLM_TILE_K;
+  const size_t smem =
+      (tile_k + CEILDIV(tile_k, WARP_SIZE)) * sizeof(float);
+  auto kernel = nvfp4_gemm::nvfp4_matmul_smallm_tiled_kernel<half>;
+  if (smem > 48 * 1024) {
+    const cudaError_t status = cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (status != cudaSuccess)
+      return status;
+  }
+  kernel<<<grid, block, smem, stream>>>(
+      input, weight, weight_scale, weight_global_scale, bias, output, M, N, K,
+      has_bias, force_lut);
+  return cudaPeekAtLastError();
+}
+
 #ifndef NO_BF16_KERNEL
 extern "C" cudaError_t nvfp4_matmul_smallm_bf16(const __nv_bfloat16 *input,
                                           const uint8_t *weight,
@@ -985,11 +1221,42 @@ extern "C" cudaError_t nvfp4_matmul_smallm_bf16(const __nv_bfloat16 *input,
                                         K, has_bias, force_lut);
   return cudaPeekAtLastError();
 }
+
+extern "C" cudaError_t nvfp4_matmul_smallm_tiled_bf16(
+    const __nv_bfloat16 *input, const uint8_t *weight,
+    const uint8_t *weight_scale, float weight_global_scale,
+    const __nv_bfloat16 *bias, __nv_bfloat16 *output, int M, int N, int K,
+    bool has_bias, bool force_lut, cudaStream_t stream) {
+  using namespace nvfp4_gemm;
+  constexpr int THREADS = BLOCK_N_SM * WARP_SIZE;
+  dim3 block(THREADS);
+  dim3 grid(CEILDIV(N, BLOCK_N_SM), M);
+  const int tile_k = K < SMALLM_TILE_K ? K : SMALLM_TILE_K;
+  const size_t smem =
+      (tile_k + CEILDIV(tile_k, WARP_SIZE)) * sizeof(float);
+  auto kernel =
+      nvfp4_gemm::nvfp4_matmul_smallm_tiled_kernel<__nv_bfloat16>;
+  if (smem > 48 * 1024) {
+    const cudaError_t status = cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (status != cudaSuccess)
+      return status;
+  }
+  kernel<<<grid, block, smem, stream>>>(
+      input, weight, weight_scale, weight_global_scale, bias, output, M, N, K,
+      has_bias, force_lut);
+  return cudaPeekAtLastError();
+}
 #else
 extern "C" cudaError_t nvfp4_matmul_smallm_bf16(const void *, const uint8_t *,
                                           const uint8_t *, float, const void *,
                                           void *, int, int, int, bool, bool,
                                           cudaStream_t) {
+  return cudaErrorNotSupported;
+}
+extern "C" cudaError_t nvfp4_matmul_smallm_tiled_bf16(
+    const void *, const uint8_t *, const uint8_t *, float, const void *, void *,
+    int, int, int, bool, bool, cudaStream_t) {
   return cudaErrorNotSupported;
 }
 #endif
