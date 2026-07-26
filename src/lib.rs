@@ -20,6 +20,8 @@ pub use paged_attention::convert_to_fp8;
 use paged_attention::{paged_attention, reshape_and_cache};
 use scale_update::kv_scale_update;
 pub mod fused_rope;
+#[cfg(feature = "cuda")]
+pub mod kv_cache_copy;
 pub mod mask;
 pub mod qk_rmsnorm_rope;
 #[cfg(feature = "cuda")]

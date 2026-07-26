@@ -1,6 +1,15 @@
 use core::ffi::{c_int, c_long, c_void};
 #[allow(dead_code)]
 extern "C" {
+    pub fn copy_kv_cache_block_raw(
+        key_source: *const c_void,
+        key_destination: *mut c_void,
+        value_source: *const c_void,
+        value_destination: *mut c_void,
+        block_bytes: u64,
+        stream: i64,
+    ) -> c_int;
+
     pub fn qk_rmsnorm_rope_bf16(
         qkv: *const c_void,
         q_weight: *const f32,
