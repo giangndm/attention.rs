@@ -135,3 +135,36 @@ impl Sampler {
         candle_core::bail!("Sampler requires CUDA or Metal device")
     }
 }
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use candle_core::{Device, Tensor};
+
+    use super::Sampler;
+
+    #[test]
+    fn cuda_sampling_is_invariant_to_batch_row_order() -> candle_core::Result<()> {
+        if !candle_core::utils::cuda_is_available() {
+            return Ok(());
+        }
+
+        let device = Device::new_cuda(0)?;
+        let sampler = Sampler::new();
+        let logits_ab = Tensor::from_vec(
+            vec![2.0f32, 1.5, 1.0, 0.0, 0.5, 1.0, 3.0, 2.5],
+            (2, 4),
+            &device,
+        )?;
+        let logits_ba = Tensor::from_vec(
+            vec![0.5f32, 1.0, 3.0, 2.5, 2.0, 1.5, 1.0, 0.0],
+            (2, 4),
+            &device,
+        )?;
+
+        let tokens_ab = sampler.sample_cuda(&logits_ab, 3, 1.0, 1.0, &[17, 29], &[4, 8])?;
+        let tokens_ba = sampler.sample_cuda(&logits_ba, 3, 1.0, 1.0, &[29, 17], &[8, 4])?;
+
+        assert_eq!(tokens_ab, vec![tokens_ba[1], tokens_ba[0]]);
+        Ok(())
+    }
+}

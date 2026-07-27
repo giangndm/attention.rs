@@ -27,12 +27,13 @@ impl LogitsProcessor {
         #[cfg(feature = "cuda")]
         {
             if let Some((k, p, t)) = get_params(sampling) {
-                let seed = self.rng.lock().next_u64();
+                let seeds = self.session_rngs.iter_mut().map(|rng| rng.next_u64()).collect::<Vec<_>>();
+                let positions = self.session_positions.as_slice();
                 let sampler = self.fast_sampler.lock().unwrap();
                 
                 // This call happens entirely on the GPU
                 // Only the resulting u32 token IDs are transferred back.
-                return sampler.sample_cuda(logits, k, p, t, seed);
+                return sampler.sample_cuda(logits, k, p, t, &seeds, positions);
             }
         }
         
@@ -57,10 +58,11 @@ let logits = Tensor::randn(0.0, 1.0, (4, 128000), &device)?.to_dtype(DType::F16)
 let top_k = 50;
 let top_p = 0.95;
 let temperature = 0.7;
-let seed = 42;
+let seeds = [42, 99, 123, 456];
+let positions = [0, 0, 0, 0];
 
 let sampled_tokens = sampler.sample_cuda(
-    &logits, top_k, top_p, temperature, seed,
+    &logits, top_k, top_p, temperature, &seeds, &positions,
 )?;
 
 println!("Sampled tokens: {:?}", sampled_tokens); // Vec<u32> length 4
@@ -69,4 +71,4 @@ println!("Sampled tokens: {:?}", sampled_tokens); // Vec<u32> length 4
 ## Performance Benefits
 - **Zero Latency**: No need to sync large logit tensors to the CPU.
 - **High Throughput**: Can sample for thousands of sequences in parallel.
-- **Deterministic**: Fully supports seeding for reproducible generation.
+- **Deterministic**: Each batch row supplies its own seed and generation position, so unrelated sessions and row ordering cannot alter a replay.
