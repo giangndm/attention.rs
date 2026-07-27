@@ -172,8 +172,8 @@ __global__ void stageB_reduce_and_sample(
     const int* __restrict__ tile_idx,    // [B, tiles, K]
     float top_p,
     int top_k,
-    uint64_t seed,
-    uint64_t token_pos,
+    const uint64_t* __restrict__ seeds,
+    const uint64_t* __restrict__ token_pos,
     int* __restrict__ out_tokens         // [B]
 ) {
   int b = blockIdx.x;
@@ -257,11 +257,12 @@ __global__ void stageB_reduce_and_sample(
     for (int t = 0; t < cutoff; ++t) psum += probs[t];
     psum = fmaxf(psum, 1e-20f);
 
-    // Deterministic RNG: per (b, token_pos)
-    uint2 key = make_uint2((uint32_t)(seed ^ (0x9E3779B97f4A7C15ULL + (uint64_t)b)),
+    // Deterministic RNG: one caller-owned seed/counter pair per row.
+    uint64_t seed = seeds[b];
+    uint64_t position = token_pos[b];
+    uint2 key = make_uint2((uint32_t)(seed ^ 0x9E3779B97f4A7C15ULL),
                            (uint32_t)((seed >> 32) + 0xD1B54A32D192ED03ULL));
-    uint4 ctr = make_uint4((uint32_t)token_pos, (uint32_t)(token_pos >> 32),
-                           (uint32_t)b, 0x12345678u);
+    uint4 ctr = make_uint4((uint32_t)position, (uint32_t)(position >> 32), 0, 0x12345678u);
     uint4 r = philox4x32_10(key, ctr);
     float u = u01_from_u32(r.x);
 
@@ -316,7 +317,7 @@ void gpu_topk_topp_sample(
   dim3 blockB(256, 1, 1);
   stageB_reduce_and_sample<K, 256>
       <<<gridB, blockB, 0, stream>>>(
-          p.B, tiles, tile_vals_d, tile_idx_d, p.top_p, p.top_k, p.seed, p.token_pos, out_tokens_d);
+          p.B, tiles, tile_vals_d, tile_idx_d, p.top_p, p.top_k, p.seeds, p.token_pos, out_tokens_d);
 
   CUDA_CHECK(cudaGetLastError());
 
@@ -353,8 +354,8 @@ extern "C" void sampling_f32(
     int K,
     float temperature,
     float top_p,
-    uint64_t seed,
-    uint64_t token_pos,
+    const uint64_t* seeds,
+    const uint64_t* token_pos,
     int64_t stream_ptr) 
 {
     SamplerParams p;
@@ -367,7 +368,7 @@ extern "C" void sampling_f32(
     if (k_eff < 1) k_eff = 1;
     if (k_eff > 256) k_eff = 256;
     p.top_k = k_eff;
-    p.seed = seed;
+    p.seeds = seeds;
     p.token_pos = token_pos;
 
     cudaStream_t stream = (cudaStream_t)stream_ptr;
@@ -391,8 +392,8 @@ extern "C" void sampling_f16(
     int K,
     float temperature,
     float top_p,
-    uint64_t seed,
-    uint64_t token_pos,
+    const uint64_t* seeds,
+    const uint64_t* token_pos,
     int64_t stream_ptr) 
 {
     SamplerParams p;
@@ -405,7 +406,7 @@ extern "C" void sampling_f16(
     if (k_eff < 1) k_eff = 1;
     if (k_eff > 256) k_eff = 256;
     p.top_k = k_eff;
-    p.seed = seed;
+    p.seeds = seeds;
     p.token_pos = token_pos;
 
     cudaStream_t stream = (cudaStream_t)stream_ptr;
@@ -430,8 +431,8 @@ extern "C" void sampling_bf16(
     int K,
     float temperature,
     float top_p,
-    uint64_t seed,
-    uint64_t token_pos,
+    const uint64_t* seeds,
+    const uint64_t* token_pos,
     int64_t stream_ptr) 
 {
     SamplerParams p;
@@ -444,7 +445,7 @@ extern "C" void sampling_bf16(
     if (k_eff < 1) k_eff = 1;
     if (k_eff > 256) k_eff = 256;
     p.top_k = k_eff;
-    p.seed = seed;
+    p.seeds = seeds;
     p.token_pos = token_pos;
 
     cudaStream_t stream = (cudaStream_t)stream_ptr;

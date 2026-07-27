@@ -3,31 +3,11 @@ use candle_core::{Result, Tensor};
 use kernels::ffi;
 #[cfg(feature = "metal")]
 use metal;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-pub struct Sampler {
-    /// Internal token position counter, auto-incremented on each sample call.
-    /// Wraps to 0 when approaching u32::MAX to avoid overflow.
-    token_pos: AtomicU64,
-}
+pub struct Sampler;
 
 impl Sampler {
     pub fn new() -> Self {
-        Self {
-            token_pos: AtomicU64::new(0),
-        }
-    }
-
-    /// Increment token_pos and wrap to 0 if it reaches u32::MAX
-    fn next_token_pos(&self) -> u64 {
-        let current = self.token_pos.fetch_add(1, Ordering::Relaxed);
-        // Wrap around when approaching u32::MAX
-        if current >= u32::MAX as u64 {
-            self.token_pos.store(0, Ordering::Relaxed);
-            0
-        } else {
-            current
-        }
+        Self
     }
 
     #[cfg(feature = "cuda")]
@@ -37,15 +17,18 @@ impl Sampler {
         k: usize,
         p: f32,
         temperature: f32,
-        seed: u64,
+        seeds: &[u64],
+        positions: &[u64],
     ) -> Result<Vec<u32>> {
-        let token_pos = self.next_token_pos();
         use candle_core::cuda_backend::cudarc::driver::DevicePtr;
         use candle_core::cuda_backend::CudaStorageSlice;
         use candle_core::cuda_backend::WrapErr;
         use candle_core::DType;
 
         let (b, v) = logits.dims2()?;
+        if seeds.len() != b || positions.len() != b {
+            candle_core::bail!("sampler requires one seed and position per batch row")
+        }
         let dev = logits.device().as_cuda_device()?;
         let dtype = logits.dtype();
 
@@ -64,7 +47,11 @@ impl Sampler {
 
         // 2. Alloc output buffer
         let out_tokens = unsafe { dev.alloc::<i32>(b) }.w()?;
+        let seed_buffer = dev.htod_sync_copy(seeds).w()?;
+        let position_buffer = dev.htod_sync_copy(positions).w()?;
         let out_ptr = out_tokens.device_ptr();
+        let seeds_ptr = *seed_buffer.device_ptr() as *const u64;
+        let positions_ptr = *position_buffer.device_ptr() as *const u64;
         let stream = *dev.cu_stream() as i64;
         let out_ptr = *out_ptr as *mut core::ffi::c_void;
 
@@ -84,8 +71,8 @@ impl Sampler {
                         k as i32,
                         temperature,
                         p,
-                        seed,
-                        token_pos,
+                        seeds_ptr,
+                        positions_ptr,
                         stream,
                     );
                 }
@@ -104,8 +91,8 @@ impl Sampler {
                         k as i32,
                         temperature,
                         p,
-                        seed,
-                        token_pos,
+                        seeds_ptr,
+                        positions_ptr,
                         stream,
                     );
                 }
@@ -124,8 +111,8 @@ impl Sampler {
                         k as i32,
                         temperature,
                         p,
-                        seed,
-                        token_pos,
+                        seeds_ptr,
+                        positions_ptr,
                         stream,
                     );
                 }

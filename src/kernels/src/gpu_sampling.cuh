@@ -16,8 +16,8 @@ struct SamplerParams {
   float temperature; // 0 => greedy-like behavior (handled as large invT)
   float top_p;      // <=0 or >=1 => disabled; else top-p within top-k
   int top_k;        // requested top-k (<=0 means no top-k cap)
-  uint64_t seed;    // base seed
-  uint64_t token_pos; // monotonically increasing per generated token (for determinism)
+  const uint64_t* seeds;      // [B], owned by the corresponding session rows
+  const uint64_t* token_pos;  // [B], owned by the corresponding session rows
 };
 
 // Runtime entrypoint (supports K=32, 64, 128, or 256 via template instantiation)

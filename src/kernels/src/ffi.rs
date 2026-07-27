@@ -725,8 +725,8 @@ extern "C" {
         K: i32,
         temperature: f32,
         top_p: f32,
-        seed: u64,
-        token_pos: u64,
+        seeds: *const u64,
+        token_pos: *const u64,
         stream: i64,
     );
 
@@ -738,8 +738,8 @@ extern "C" {
         K: i32,
         temperature: f32,
         top_p: f32,
-        seed: u64,
-        token_pos: u64,
+        seeds: *const u64,
+        token_pos: *const u64,
         stream: i64,
     );
 
@@ -751,8 +751,8 @@ extern "C" {
         K: i32,
         temperature: f32,
         top_p: f32,
-        seed: u64,
-        token_pos: u64,
+        seeds: *const u64,
+        token_pos: *const u64,
         stream: i64,
     );
 
