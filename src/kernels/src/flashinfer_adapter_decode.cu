@@ -269,7 +269,7 @@ void flashinfer_decode_plan_wrapper(
 #endif
 }
 
-int flashinfer_decode_run_wrapper(
+void flashinfer_decode_run_wrapper(
     void* out_ptr,
     void* q_ptr,
     void* k_data, void* v_data,
@@ -296,34 +296,33 @@ int flashinfer_decode_run_wrapper(
     cudaStream_t stream
 ) {
 #ifdef USE_FLASHINFER
-    if (out_ptr == nullptr || q_ptr == nullptr || k_data == nullptr || v_data == nullptr ||
-        indices == nullptr || indptr == nullptr || last_len == nullptr ||
-        workspace_float == nullptr || workspace_int == nullptr || plan_info_vec == nullptr) {
-        return static_cast<int>(cudaErrorInvalidValue);
-    }
     if (num_kv_heads <= 0 || num_qo_heads <= 0 || (num_qo_heads % num_kv_heads) != 0) {
         fprintf(stderr,
                 "[flashinfer][decode_run] invalid head config qo_heads=%d kv_heads=%d\n",
                 num_qo_heads, num_kv_heads);
-        return static_cast<int>(cudaErrorInvalidValue);
+        return;
     }
     uint32_t group_size = static_cast<uint32_t>(num_qo_heads / num_kv_heads);
     if (!IsSupportedDecodeGroupSize(group_size)) {
         fprintf(stderr,
                 "[flashinfer][decode_run] unsupported group_size=%u (supported: 1,2,3,4,6,8,16,32,64)\n",
                 group_size);
-        return static_cast<int>(cudaErrorNotSupported);
+        return;
     }
     if (!IsSupportedDecodeHeadDimForGroupSize(group_size, static_cast<uint32_t>(head_dim))) {
         fprintf(stderr,
                 "[flashinfer][decode_run] unsupported combination group_size=%u head_dim=%d (group_size=64 requires head_dim<=128)\n",
                 group_size, head_dim);
-        return static_cast<int>(cudaErrorNotSupported);
+        return;
     }
     const float rope_scale = 1.0f;
     const float rope_theta = 10000.0f;
     if (data_type == 2) {
         #if defined(FLASHINFER_ENABLE_FP8_E4M3)
+        if (plan_info_vec == nullptr) {
+            fprintf(stderr, "[flashinfer][decode_run] plan_info_vec is null\n");
+            return;
+        }
         auto run_decode_fp8 = [&](auto dtype_q_val) {
             using DTypeQ = decltype(dtype_q_val);
             using DTypeKV = __nv_fp8_e4m3;
@@ -381,10 +380,12 @@ int flashinfer_decode_run_wrapper(
         } else {
             run_decode_fp8(half{});
         }
-        return static_cast<int>(cudaPeekAtLastError());
-        #else
-        return static_cast<int>(cudaErrorNotSupported);
         #endif
+        return;
+    }
+    if (plan_info_vec == nullptr) {
+        fprintf(stderr, "[flashinfer][decode_run] plan_info_vec is null\n");
+        return;
     }
     auto run_decode = [&](auto dtype_kv_val) {
         using DTypeKV = decltype(dtype_kv_val);
@@ -443,9 +444,6 @@ int flashinfer_decode_run_wrapper(
     } else {
         run_decode(half{});
     }
-    return static_cast<int>(cudaPeekAtLastError());
-#else
-    return static_cast<int>(cudaErrorNotSupported);
 #endif
 }
 

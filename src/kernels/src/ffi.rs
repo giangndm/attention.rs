@@ -1325,7 +1325,7 @@ extern "C" {
         data_type: i32,
         out_data_type: i32,
         stream: i64,
-    ) -> c_int;
+    );
 
     #[cfg(feature = "flashinfer")]
     pub fn flashinfer_decode_run_wrapper_fp8(
@@ -1352,7 +1352,7 @@ extern "C" {
         data_type: i32,
         out_data_type: i32,
         stream: i64,
-    ) -> c_int;
+    );
 
     #[cfg(feature = "flashinfer")]
     pub fn flashinfer_prefill_plan_wrapper(
