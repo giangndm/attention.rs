@@ -1,5 +1,35 @@
 #include "flashinfer_common.cuh"
 
+#ifdef USE_FLASHINFER
+template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
+          typename AttentionVariant, typename Params>
+inline cudaError_t DecodeWorkEstimationWithMinChunkPages(
+    uint32_t min_chunk_pages,
+    bool& split_kv, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
+    uint32_t& new_batch_size, uint32_t& gdy, uint32_t batch_size,
+    typename Params::IdType* kv_indptr_h, const uint32_t num_qo_heads,
+    const uint32_t page_size, bool enable_cuda_graph, cudaStream_t stream) {
+    using IdType = typename Params::IdType;
+    cudaError_t status = BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
+        GROUP_SIZE, HEAD_DIM, POS_ENCODING_MODE, AttentionVariant, Params>(
+            split_kv, max_grid_size, max_num_pages_per_batch, new_batch_size, gdy,
+            batch_size, kv_indptr_h, num_qo_heads, page_size, enable_cuda_graph, stream);
+    if (status != cudaSuccess || min_chunk_pages == 4 || batch_size * gdy >= max_grid_size) {
+        return status;
+    }
+
+    std::vector<IdType> num_pages(batch_size);
+    for (uint32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+        num_pages[batch_idx] = kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx];
+    }
+    std::tie(max_num_pages_per_batch, new_batch_size) =
+        PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
+            max_grid_size, gdy, num_pages, min_chunk_pages);
+    split_kv = enable_cuda_graph || new_batch_size != batch_size;
+    return cudaSuccess;
+}
+#endif
+
 #if defined(FLASHINFER_ENABLE_FP8_E4M3)
 extern "C" {
 void flashinfer_fp8_quantize_kv_scalar(const void* k_in, const void* v_in,
@@ -149,6 +179,7 @@ void flashinfer_decode_plan_wrapper(
     bool enable_cuda_graph,
     int32_t data_type,
     int32_t out_data_type,
+    int32_t min_chunk_pages,
     int64_t* plan_info_out,
     cudaStream_t stream
 ) {
@@ -188,15 +219,28 @@ void flashinfer_decode_plan_wrapper(
                     using AttentionType = DefaultDecodeAttention;
                     using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
 
+                    auto work_estimation = [min_chunk_pages](
+                        bool& split_kv, uint32_t& max_grid_size,
+                        uint32_t& max_num_pages_per_batch, uint32_t& new_batch_size,
+                        uint32_t& gdy, uint32_t planner_batch_size, IdType* kv_indptr_h,
+                        const uint32_t planner_num_qo_heads, const uint32_t planner_page_size,
+                        bool planner_enable_cuda_graph, cudaStream_t planner_stream) {
+                        return DecodeWorkEstimationWithMinChunkPages<
+                            GROUP_SIZE, HEAD_DIM, PosEncodingMode::kNone,
+                            AttentionType, ParamsType>(
+                                static_cast<uint32_t>(min_chunk_pages), split_kv,
+                                max_grid_size, max_num_pages_per_batch, new_batch_size, gdy,
+                                planner_batch_size, kv_indptr_h, planner_num_qo_heads,
+                                planner_page_size, planner_enable_cuda_graph, planner_stream);
+                    };
+
                     DecodePlanInfo plan_info;
                     DecodePlan<HEAD_DIM, PosEncodingMode::kNone, AttentionType, ParamsType>(
                         workspace_float, workspace_float_size,
                         workspace_int, page_locked_int_buffer, workspace_int_size,
                         plan_info,
                         indptr_host, batch_size, num_qo_heads, page_size, enable_cuda_graph, stream,
-                        BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
-                            GROUP_SIZE, HEAD_DIM, PosEncodingMode::kNone,
-                            AttentionType, ParamsType>
+                        work_estimation
                     );
 
                     if (plan_info_out != nullptr) {

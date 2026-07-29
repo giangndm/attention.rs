@@ -1271,6 +1271,7 @@ extern "C" {
         enable_cuda_graph: bool,
         data_type: i32,
         out_data_type: i32,
+        min_chunk_pages: i32,
         plan_info_out: *mut i64, // length 10
         stream: i64,
     );
