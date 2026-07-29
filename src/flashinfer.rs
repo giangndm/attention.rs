@@ -27,61 +27,6 @@ fn is_supported_flashinfer_decode_shape(group_size: usize, head_dim: usize) -> b
     !(group_size == 64 && head_dim > 128)
 }
 
-const DEFAULT_DECODE_MIN_CHUNK_PAGES: usize = 4;
-
-#[derive(Clone, Copy)]
-struct DecodePlannerPolicyInput {
-    sm: i32,
-    batch_size: usize,
-    kv_data_type: i32,
-    page_size: usize,
-    num_qo_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    enable_cuda_graph: bool,
-}
-
-fn decode_min_chunk_pages(input: DecodePlannerPolicyInput, screened_pages: usize) -> usize {
-    if matches!(screened_pages, 2 | 4)
-        && input.sm == 120
-        && input.batch_size == 1
-        && input.kv_data_type == 2
-        && input.page_size == 32
-        && input.num_qo_heads == 64
-        && input.num_kv_heads == 8
-        && input.head_dim == 128
-        && !input.enable_cuda_graph
-    {
-        screened_pages
-    } else {
-        DEFAULT_DECODE_MIN_CHUNK_PAGES
-    }
-}
-
-fn screened_decode_min_chunk_pages() -> usize {
-    match option_env!("ATTENTION_RS_FLASHINFER_DECODE_MIN_CHUNK_PAGES") {
-        Some("2") => 2,
-        _ => DEFAULT_DECODE_MIN_CHUNK_PAGES,
-    }
-}
-
-/// Occupancy and split-KV values produced by the generic FlashInfer decode planner.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DecodePlanInstrumentation {
-    /// Occupancy-limited blocks per streaming multiprocessor.
-    pub num_blocks_per_sm: u32,
-    /// Streaming multiprocessors reported by the active CUDA device.
-    pub num_sm: u32,
-    /// Maximum planner grid derived from production kernel occupancy.
-    pub max_grid_size: u32,
-    /// Minimum KV chunk size requested by the selected build policy, in pages.
-    pub requested_min_chunk_pages: u32,
-    /// KV chunk size chosen by the planner, in pages.
-    pub effective_chunk_pages: u32,
-    /// Split-KV batch size produced by the planner.
-    pub new_batch_size: u32,
-}
-
 pub(crate) fn get_cuda_ptr(t: &Tensor) -> Result<*const core::ffi::c_void> {
     let (s, l) = t.storage_and_layout();
     match (&*s, t.dtype()) {
@@ -746,73 +691,6 @@ pub fn decode_plan(
     page_size: usize,
     enable_cuda_graph: bool,
 ) -> Result<Vec<i64>> {
-    let (plan, instrumentation) = decode_plan_with_instrumentation(
-        dev,
-        kv_dtype,
-        out_dtype,
-        indptr_host,
-        last_len_host,
-        kv_len_arr_host,
-        batch_size,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        enable_cuda_graph,
-    )?;
-    tracing::debug!(?instrumentation, "FlashInfer decode plan");
-    Ok(plan)
-}
-
-/// Builds a generic FlashInfer decode plan and returns its production planner telemetry.
-#[allow(clippy::too_many_arguments)]
-pub fn decode_plan_with_instrumentation(
-    dev: &candle_core::Device,
-    kv_dtype: DType,
-    out_dtype: DType,
-    indptr_host: &[u32],
-    last_len_host: Option<&[u32]>,
-    kv_len_arr_host: Option<&[u32]>,
-    batch_size: usize,
-    num_qo_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    page_size: usize,
-    enable_cuda_graph: bool,
-) -> Result<(Vec<i64>, DecodePlanInstrumentation)> {
-    decode_plan_with_screened_chunk_pages(
-        dev,
-        kv_dtype,
-        out_dtype,
-        indptr_host,
-        last_len_host,
-        kv_len_arr_host,
-        batch_size,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        enable_cuda_graph,
-        screened_decode_min_chunk_pages(),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn decode_plan_with_screened_chunk_pages(
-    dev: &candle_core::Device,
-    kv_dtype: DType,
-    out_dtype: DType,
-    indptr_host: &[u32],
-    last_len_host: Option<&[u32]>,
-    kv_len_arr_host: Option<&[u32]>,
-    batch_size: usize,
-    num_qo_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    page_size: usize,
-    enable_cuda_graph: bool,
-    screened_chunk_pages: usize,
-) -> Result<(Vec<i64>, DecodePlanInstrumentation)> {
     let dev = dev.as_cuda_device()?;
     if num_kv_heads == 0 || num_qo_heads % num_kv_heads != 0 {
         candle::bail!(
@@ -856,19 +734,6 @@ fn decode_plan_with_screened_chunk_pages(
     };
 
     let sm = cuda_utils::sm_version(dev).unwrap_or(0);
-    let min_chunk_pages = decode_min_chunk_pages(
-        DecodePlannerPolicyInput {
-            sm,
-            batch_size,
-            kv_data_type: data_type,
-            page_size,
-            num_qo_heads,
-            num_kv_heads,
-            head_dim,
-            enable_cuda_graph,
-        },
-        screened_chunk_pages,
-    );
     let (ws_float_ptr, ws_float_size, ws_int_ptr, ws_int_size, page_locked_ptr, page_locked_size) =
         get_plan_workspace(dev, enable_cuda_graph)?;
 
@@ -900,7 +765,6 @@ fn decode_plan_with_screened_chunk_pages(
     let qo_indptr_host = Some(qo_indptr);
     let use_sm90_fp8 = false;
     let mut plan_info = vec![0i64; if use_sm90_fp8 { 9 } else { 10 }];
-    let mut instrumentation = [0_i64; 6];
     unsafe {
         if use_sm90_fp8 {
             kernels::ffi::flashinfer_decode_plan_wrapper_fp8(
@@ -949,9 +813,7 @@ fn decode_plan_with_screened_chunk_pages(
                 enable_cuda_graph,
                 data_type,
                 out_data_type,
-                min_chunk_pages as i32,
                 plan_info.as_mut_ptr(),
-                instrumentation.as_mut_ptr(),
                 *dev.cu_stream() as i64,
             );
         }
@@ -965,15 +827,7 @@ fn decode_plan_with_screened_chunk_pages(
         sm
     };
     validate_decode_plan_info(&plan_info, data_type, validate_sm)?;
-    let instrumentation = DecodePlanInstrumentation {
-        num_blocks_per_sm: instrumentation[0] as u32,
-        num_sm: instrumentation[1] as u32,
-        max_grid_size: instrumentation[2] as u32,
-        requested_min_chunk_pages: instrumentation[3] as u32,
-        effective_chunk_pages: instrumentation[4] as u32,
-        new_batch_size: instrumentation[5] as u32,
-    };
-    Ok((plan_info, instrumentation))
+    Ok(plan_info)
 }
 
 /// Compute the prefill plan once per model forward. Returns a tagged i64 vector (16 elements).
@@ -1728,282 +1582,9 @@ pub fn prefill_ragged(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        decode_min_chunk_pages, decode_plan_with_instrumentation,
-        decode_plan_with_screened_chunk_pages, decode_with_plan, DecodePlannerPolicyInput,
-    };
     use crate::workspace::{
         workspace_regions, GEMM_SCRATCH_FLOAT_SIZE, WORKSPACE_FLOAT_SIZE, WORKSPACE_INT_SIZE,
     };
-    use candle_core::{DType, Device, Result, Tensor};
-    use half::f16;
-
-    fn target_policy_input() -> DecodePlannerPolicyInput {
-        DecodePlannerPolicyInput {
-            sm: 120,
-            batch_size: 1,
-            kv_data_type: 2,
-            page_size: 32,
-            num_qo_heads: 64,
-            num_kv_heads: 8,
-            head_dim: 128,
-            enable_cuda_graph: false,
-        }
-    }
-
-    #[test]
-    fn decode_chunk_policy_accepts_only_control_and_candidate() {
-        let input = target_policy_input();
-        assert_eq!(decode_min_chunk_pages(input, 2), 2);
-        assert_eq!(decode_min_chunk_pages(input, 4), 4);
-        assert_eq!(decode_min_chunk_pages(input, 8), 4);
-    }
-
-    #[test]
-    fn decode_chunk_policy_preserves_default_outside_exact_target() {
-        let target = target_policy_input();
-        let ineligible = [
-            DecodePlannerPolicyInput { sm: 121, ..target },
-            DecodePlannerPolicyInput {
-                batch_size: 2,
-                ..target
-            },
-            DecodePlannerPolicyInput {
-                kv_data_type: 1,
-                ..target
-            },
-            DecodePlannerPolicyInput {
-                page_size: 16,
-                ..target
-            },
-            DecodePlannerPolicyInput {
-                num_qo_heads: 63,
-                ..target
-            },
-            DecodePlannerPolicyInput {
-                num_kv_heads: 4,
-                ..target
-            },
-            DecodePlannerPolicyInput {
-                head_dim: 256,
-                ..target
-            },
-            DecodePlannerPolicyInput {
-                enable_cuda_graph: true,
-                ..target
-            },
-        ];
-        for input in ineligible {
-            assert_eq!(decode_min_chunk_pages(input, 2), 4);
-        }
-    }
-
-    #[test]
-    fn sm120_decode_planner_reports_production_occupancy() -> Result<()> {
-        let device = Device::new_cuda(0)?;
-        if crate::cuda_utils::sm_version(device.as_cuda_device()?).unwrap_or(0) != 120 {
-            return Ok(());
-        }
-
-        let context_len = 4096_u32;
-        let page_count = context_len.div_ceil(32);
-        let (plan, instrumentation) = decode_plan_with_instrumentation(
-            &device,
-            DType::U8,
-            DType::F16,
-            &[0, page_count],
-            Some(&[32]),
-            Some(&[context_len]),
-            1,
-            64,
-            8,
-            128,
-            32,
-            false,
-        )?;
-
-        assert_eq!(plan.len(), 10);
-        assert_eq!(
-            instrumentation.max_grid_size,
-            instrumentation.num_blocks_per_sm * instrumentation.num_sm
-        );
-        assert!(instrumentation.effective_chunk_pages >= instrumentation.requested_min_chunk_pages);
-        assert_eq!(
-            instrumentation.new_batch_size,
-            page_count.div_ceil(instrumentation.effective_chunk_pages)
-        );
-        eprintln!("flashinfer_decode_preflight={instrumentation:?}");
-        Ok(())
-    }
-
-    #[test]
-    fn sm120_decode_chunk_two_matches_control_and_restores_plan_workspace() -> Result<()> {
-        const PAGE_SIZE: usize = 32;
-        const NUM_QO_HEADS: usize = 64;
-        const NUM_KV_HEADS: usize = 8;
-        const HEAD_DIM: usize = 128;
-
-        let device = Device::new_cuda(0)?;
-        if crate::cuda_utils::sm_version(device.as_cuda_device()?).unwrap_or(0) != 120
-            || !crate::has_flashinfer_fp8_e4m3()
-        {
-            return Ok(());
-        }
-
-        let ineligible_indptr = [0_u32, 4];
-        let ineligible_last_len = [32_u32];
-        let ineligible_kv_len = [128_u32];
-        let (control_plan, _) = decode_plan_with_screened_chunk_pages(
-            &device,
-            DType::U8,
-            DType::F16,
-            &ineligible_indptr,
-            Some(&ineligible_last_len),
-            Some(&ineligible_kv_len),
-            1,
-            32,
-            NUM_KV_HEADS,
-            HEAD_DIM,
-            PAGE_SIZE,
-            false,
-            4,
-        )?;
-        let (candidate_plan, _) = decode_plan_with_screened_chunk_pages(
-            &device,
-            DType::U8,
-            DType::F16,
-            &ineligible_indptr,
-            Some(&ineligible_last_len),
-            Some(&ineligible_kv_len),
-            1,
-            32,
-            NUM_KV_HEADS,
-            HEAD_DIM,
-            PAGE_SIZE,
-            false,
-            2,
-        )?;
-        assert_eq!(candidate_plan, control_plan);
-
-        let query = Tensor::from_vec(
-            (0..NUM_QO_HEADS * HEAD_DIM)
-                .map(|index| f16::from_f32((index % 29) as f32 / 32.0 - 0.4))
-                .collect::<Vec<_>>(),
-            (1, NUM_QO_HEADS, HEAD_DIM),
-            &device,
-        )?;
-        let scales = Tensor::ones(NUM_KV_HEADS, DType::F32, &device)?;
-
-        for context_len in [63_usize, 64, 65, 127, 128, 129, 4096] {
-            let page_count = context_len.div_ceil(PAGE_SIZE);
-            let physical_page_count = page_count * 2 + 1;
-            let indices_host = (0..page_count)
-                .map(|page| (page * 2 + 1) as u32)
-                .collect::<Vec<_>>();
-            let indptr_host = [0_u32, page_count as u32];
-            let last_len_host = [((context_len - 1) % PAGE_SIZE + 1) as u32];
-            let key_cache = Tensor::zeros(
-                (physical_page_count, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM),
-                DType::U8,
-                &device,
-            )?;
-            let value_cache = key_cache.zeros_like()?;
-            let key = Tensor::from_vec(
-                (0..context_len * NUM_KV_HEADS * HEAD_DIM)
-                    .map(|index| f16::from_f32((index % 31) as f32 / 64.0 - 0.2))
-                    .collect::<Vec<_>>(),
-                (context_len, NUM_KV_HEADS, HEAD_DIM),
-                &device,
-            )?;
-            let value = Tensor::from_vec(
-                (0..context_len * NUM_KV_HEADS * HEAD_DIM)
-                    .map(|index| f16::from_f32((index % 37) as f32 / 48.0 - 0.3))
-                    .collect::<Vec<_>>(),
-                (context_len, NUM_KV_HEADS, HEAD_DIM),
-                &device,
-            )?;
-            let indices = Tensor::from_vec(indices_host, page_count, &device)?;
-            let indptr = Tensor::from_vec(indptr_host.to_vec(), 2, &device)?;
-            let last_len = Tensor::from_vec(last_len_host.to_vec(), 1, &device)?;
-            let batch_indices = Tensor::zeros(context_len, DType::U32, &device)?;
-            let positions = Tensor::from_vec(
-                (0..context_len as u32).collect::<Vec<_>>(),
-                context_len,
-                &device,
-            )?;
-            super::append_kv_cache(
-                &key,
-                &value,
-                &key_cache,
-                &value_cache,
-                Some(&scales),
-                Some(&scales),
-                &indices,
-                &indptr,
-                &last_len,
-                Some(&batch_indices),
-                Some(&positions),
-            )?;
-            let key_before = key_cache.flatten_all()?.to_vec1::<u8>()?;
-            let value_before = value_cache.flatten_all()?.to_vec1::<u8>()?;
-
-            let mut outputs = Vec::new();
-            for chunk_pages in [4, 2, 4] {
-                let (plan, instrumentation) = decode_plan_with_screened_chunk_pages(
-                    &device,
-                    DType::U8,
-                    DType::F16,
-                    &indptr_host,
-                    Some(&last_len_host),
-                    Some(&[context_len as u32]),
-                    1,
-                    NUM_QO_HEADS,
-                    NUM_KV_HEADS,
-                    HEAD_DIM,
-                    PAGE_SIZE,
-                    false,
-                    chunk_pages,
-                )?;
-                assert_eq!(
-                    instrumentation.requested_min_chunk_pages,
-                    chunk_pages as u32
-                );
-                let output = decode_with_plan(
-                    &query,
-                    &key_cache,
-                    &value_cache,
-                    Some(&scales),
-                    Some(&scales),
-                    &indices,
-                    &indptr,
-                    &last_len,
-                    PAGE_SIZE,
-                    NUM_QO_HEADS,
-                    NUM_KV_HEADS,
-                    HEAD_DIM,
-                    1.0 / (HEAD_DIM as f32).sqrt(),
-                    &plan,
-                    false,
-                    None,
-                    None,
-                )?
-                .to_dtype(DType::F32)?
-                .flatten_all()?
-                .to_vec1::<f32>()?;
-                assert!(output.iter().all(|value| value.is_finite()));
-                outputs.push(output);
-            }
-
-            for comparison in [&outputs[1], &outputs[2]] {
-                for (&control, &other) in outputs[0].iter().zip(comparison) {
-                    assert!((control - other).abs() <= 0.02 + 0.02 * control.abs());
-                }
-            }
-            assert_eq!(key_cache.flatten_all()?.to_vec1::<u8>()?, key_before);
-            assert_eq!(value_cache.flatten_all()?.to_vec1::<u8>()?, value_before);
-        }
-        Ok(())
-    }
 
     #[test]
     fn workspace_regions_do_not_overlap_and_fit() {
