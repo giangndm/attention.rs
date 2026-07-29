@@ -219,6 +219,7 @@ pub struct FlashInferMetadata {
     pub last_len_host: Option<Vec<u32>>,
     pub kv_len_arr_host: Option<Vec<u32>>,
     pub total_num_rows: Option<u32>,
+    pub window_left: i32,
     pub batch_indices: Option<Tensor>,
     pub positions: Option<Tensor>,
     pub use_cuda_graph: bool,
@@ -244,6 +245,10 @@ pub struct InputMetadata {
     pub seqlens: Option<Vec<u32>>,
     pub flashinfer_metadata: Option<FlashInferMetadata>,
     pub is_mtp_verify: bool,
+}
+
+fn flashinfer_run_window_left(metadata_window_left: i32) -> i32 {
+    metadata_window_left
 }
 
 #[allow(dead_code)]
@@ -800,13 +805,24 @@ impl PagedAttention {
                 };
 
                 if flashinfer_group_supported {
-                    // FlashInfer FA2 path: skip per-head scale updates.
-                    // With scale=1.0, append_kv_cache does raw BF16->FP8 cast,
-                    // and the FA2 attention kernel does raw FP8->float cast — both match.
-                    // The SM90 Hopper kernel handles per-head scales natively via
-                    // its additional_params, so 1.0 scales are also fine there.
+                    // FlashInfer FA2 path: populate the paged cache with the same
+                    // slot-mapped native writer used by the fallback path.
 
                     if let (Some(kc), Some(vc)) = (key_cache.as_ref(), value_cache.as_ref()) {
+                        #[cfg(feature = "flash")]
+                        {
+                            let slot_mapping = input_metadata.slot_mapping.flatten_all()?;
+                            crate::flash::flash_reshape_and_cache(
+                                &key,
+                                &value,
+                                kc,
+                                vc,
+                                self.k_scale.as_ref(),
+                                self.v_scale.as_ref(),
+                                &slot_mapping,
+                            )?;
+                        }
+                        #[cfg(not(feature = "flash"))]
                         crate::flashinfer::append_kv_cache(
                             &key,
                             &value,
@@ -850,7 +866,7 @@ impl PagedAttention {
                             key_value_heads,
                             head_size,
                             self.scale as f32,
-                            Some(self.sliding_window.unwrap_or(0) as i32),
+                            Some(flashinfer_run_window_left(fm.window_left)),
                             Some(softcapping.unwrap_or(0.0f64) as f32),
                             plan_info,
                             fm.use_cuda_graph,
@@ -877,7 +893,7 @@ impl PagedAttention {
                             self.scale as f32,
                             plan_info,
                             fm.use_cuda_graph,
-                            Some(self.sliding_window.unwrap_or(0) as i32),
+                            Some(flashinfer_run_window_left(fm.window_left)),
                             Some(softcapping.unwrap_or(0.0f64) as f32),
                         );
                     }
@@ -1640,5 +1656,15 @@ impl PagedAttention {
             cu_seqlens_q,
             self.sliding_window,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::flashinfer_run_window_left;
+
+    #[test]
+    fn flashinfer_runner_uses_canonical_metadata_window() {
+        assert_eq!(flashinfer_run_window_left(-1), -1);
     }
 }

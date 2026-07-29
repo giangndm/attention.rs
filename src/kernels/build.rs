@@ -1,3 +1,5 @@
+#[path = "build_support/flashinfer_overlay_fingerprint.rs"]
+mod flashinfer_overlay_fingerprint;
 mod trtllm_artifacts;
 
 use anyhow::{bail, Context, Result};
@@ -58,7 +60,6 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/mxfp4_gemm_wmma.cu");
     println!("cargo:rerun-if-changed=src/nvfp4_gemm.cu");
     println!("cargo:rerun-if-changed=src/nvfp4_gemm_cutlass.cu");
-    println!("cargo:rerun-if-changed=src/nvfp4_gemm_flashinfer.cu");
     println!("cargo:rerun-if-changed=src/nvfp4_moe_cutlass.cu");
     println!("cargo:rerun-if-changed=src/nvfp4_quant.cu");
     println!("cargo:rerun-if-changed=src/mlx_nvfp4_utils.cu");
@@ -112,11 +113,7 @@ fn main() -> Result<()> {
     // Their CUTLASS-heavy translation units are not reachable without the
     // feature and otherwise make each clean build substantially slower.
     if !flashinfer_enabled {
-        builder = builder.exclude(&[
-            "flashinfer_*",
-            "gdn_flashinfer_prefill.cu",
-            "nvfp4_gemm_flashinfer.cu",
-        ]);
+        builder = builder.exclude(&["flashinfer_*", "gdn_flashinfer_prefill.cu"]);
     }
 
     let compute_cap = builder.get_compute_cap().unwrap_or(80);
@@ -233,6 +230,13 @@ fn main() -> Result<()> {
 
         let flashinfer_root = builder.fetch_git_dependency("flashinfer")?;
         let flashinfer_overlay = prepare_flashinfer_prefill_overlay(&flashinfer_root, &build_dir)?;
+        let applied_overlay = flashinfer_overlay.join("include/flashinfer/attention/prefill.cuh");
+        let overlay_fingerprint_arg =
+            flashinfer_overlay_fingerprint::cuda_object_fingerprint_arg(&applied_overlay)
+                .context("failed to fingerprint applied FlashInfer prefill overlay")?;
+        builder = builder
+            .arg(&overlay_fingerprint_arg)
+            .watch([applied_overlay]);
         builder = builder.include_path(flashinfer_overlay.join("include"));
         let csrc_dir = flashinfer_root.join("csrc");
         let trtllm_dir = csrc_dir.join("nv_internal").join("tensorrt_llm");
