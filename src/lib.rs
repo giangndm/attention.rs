@@ -19,6 +19,7 @@ use candle_core::{Device, Result, Tensor};
 pub use paged_attention::convert_to_fp8;
 use paged_attention::{paged_attention, reshape_and_cache};
 use scale_update::kv_scale_update;
+use std::sync::Arc;
 pub mod fused_rope;
 #[cfg(feature = "cuda")]
 pub mod kv_cache_copy;
@@ -213,20 +214,20 @@ const KV_SCALE_UPDATE_ITERATION: i32 = 128;
 use std::sync::atomic::{AtomicI32, Ordering};
 pub struct FlashInferMetadata {
     pub indptr: Tensor,
-    pub indptr_host: Vec<u32>,
+    pub indptr_host: Arc<Vec<u32>>,
     pub indices: Tensor,
     pub last_len: Tensor,
-    pub last_len_host: Option<Vec<u32>>,
-    pub kv_len_arr_host: Option<Vec<u32>>,
+    pub last_len_host: Option<Arc<Vec<u32>>>,
+    pub kv_len_arr_host: Option<Arc<Vec<u32>>>,
     pub total_num_rows: Option<u32>,
     pub window_left: i32,
     pub batch_indices: Option<Tensor>,
     pub positions: Option<Tensor>,
     pub use_cuda_graph: bool,
-    pub decode_plan_info: Option<Vec<i64>>,
-    pub prefill_plan_info: Option<Vec<i64>>,
-    pub mla_decode_plan_info: Option<Vec<i64>>,
-    pub mla_prefill_plan_info: Option<Vec<i64>>,
+    pub decode_plan_info: Option<Arc<Vec<i64>>>,
+    pub prefill_plan_info: Option<Arc<Vec<i64>>>,
+    pub mla_decode_plan_info: Option<Arc<Vec<i64>>>,
+    pub mla_prefill_plan_info: Option<Arc<Vec<i64>>>,
 }
 
 pub struct InputMetadata {
@@ -877,7 +878,7 @@ impl PagedAttention {
                                 "flashinfer decode requires decode_plan_info (plan+run path)",
                             )
                         })?;
-                        return crate::flashinfer::decode_with_plan(
+                        return crate::flashinfer::decode_with_plan_shared(
                             &query,
                             key_cache.as_ref().unwrap(),
                             value_cache.as_ref().unwrap(),
@@ -891,7 +892,7 @@ impl PagedAttention {
                             key_value_heads,
                             head_size,
                             self.scale as f32,
-                            plan_info,
+                            plan_info.clone(),
                             fm.use_cuda_graph,
                             Some(flashinfer_run_window_left(fm.window_left)),
                             Some(softcapping.unwrap_or(0.0f64) as f32),

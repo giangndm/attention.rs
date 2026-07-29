@@ -3,6 +3,7 @@
 use attention_rs::{flashinfer::prefill_plan, FlashInferMetadata, InputMetadata, PagedAttention};
 use candle_core::{DType, Device, Result, Tensor};
 use half::bf16;
+use std::sync::Arc;
 
 const BLOCKS: usize = 4;
 const PAGE_SIZE: usize = 32;
@@ -10,6 +11,67 @@ const HEADS: usize = 1;
 const HEAD_DIM: usize = 128;
 const QUERY_LEN: usize = 3;
 const WINDOW_LEFT: i32 = -1;
+
+#[test]
+fn flashinfer_metadata_clones_share_host_vectors_and_plans() -> Result<()> {
+    let device = Device::Cpu;
+    let indptr_host = Arc::new(vec![0_u32, 1]);
+    let last_len_host = Arc::new(vec![1_u32]);
+    let kv_len_arr_host = Arc::new(vec![1_u32]);
+    let decode_plan_info = Arc::new(vec![0_i64; 10]);
+    let metadata = FlashInferMetadata {
+        indptr: Tensor::zeros(2, DType::U32, &device)?,
+        indptr_host: indptr_host.clone(),
+        indices: Tensor::zeros(1, DType::U32, &device)?,
+        last_len: Tensor::zeros(1, DType::U32, &device)?,
+        last_len_host: Some(last_len_host.clone()),
+        kv_len_arr_host: Some(kv_len_arr_host.clone()),
+        total_num_rows: Some(1),
+        window_left: WINDOW_LEFT,
+        batch_indices: None,
+        positions: None,
+        use_cuda_graph: false,
+        decode_plan_info: Some(decode_plan_info.clone()),
+        prefill_plan_info: None,
+        mla_decode_plan_info: None,
+        mla_prefill_plan_info: None,
+    };
+
+    let clones = (0..64)
+        .map(|_| {
+            (
+                metadata.indptr_host.clone(),
+                metadata
+                    .last_len_host
+                    .as_ref()
+                    .expect("fixture has last lengths")
+                    .clone(),
+                metadata
+                    .kv_len_arr_host
+                    .as_ref()
+                    .expect("fixture has KV lengths")
+                    .clone(),
+                metadata
+                    .decode_plan_info
+                    .as_ref()
+                    .expect("fixture has decode plan")
+                    .clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    for (indptr, last_len, kv_len, plan) in &clones {
+        assert!(Arc::ptr_eq(indptr, &indptr_host));
+        assert!(Arc::ptr_eq(last_len, &last_len_host));
+        assert!(Arc::ptr_eq(kv_len, &kv_len_arr_host));
+        assert!(Arc::ptr_eq(plan, &decode_plan_info));
+    }
+    assert_eq!(Arc::strong_count(&indptr_host), 66);
+    assert_eq!(Arc::strong_count(&last_len_host), 66);
+    assert_eq!(Arc::strong_count(&kv_len_arr_host), 66);
+    assert_eq!(Arc::strong_count(&decode_plan_info), 66);
+    Ok(())
+}
 
 struct Run {
     key_bytes: Vec<u8>,
@@ -52,18 +114,18 @@ fn metadata(
     let flashinfer_metadata = if flashinfer {
         Some(FlashInferMetadata {
             indptr: Tensor::from_vec(indptr_host.clone(), 2, device)?,
-            indptr_host: indptr_host.clone(),
+            indptr_host: Arc::new(indptr_host.clone()),
             indices: Tensor::from_vec(indices_host.clone(), 2, device)?,
             last_len: Tensor::from_vec(last_len_host.clone(), 1, device)?,
-            last_len_host: Some(last_len_host),
-            kv_len_arr_host: Some(vec![context_len]),
+            last_len_host: Some(Arc::new(last_len_host)),
+            kv_len_arr_host: Some(Arc::new(vec![context_len])),
             total_num_rows: Some(query_len as u32),
             window_left: WINDOW_LEFT,
             batch_indices: None,
             positions: None,
             use_cuda_graph: false,
             decode_plan_info: None,
-            prefill_plan_info: Some(prefill_plan(
+            prefill_plan_info: Some(Arc::new(prefill_plan(
                 device,
                 &qo_indptr_host,
                 &indptr_host,
@@ -78,7 +140,7 @@ fn metadata(
                 Some(WINDOW_LEFT),
                 Some(DType::U8),
                 false,
-            )?),
+            )?)),
             mla_decode_plan_info: None,
             mla_prefill_plan_info: None,
         })

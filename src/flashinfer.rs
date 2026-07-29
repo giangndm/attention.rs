@@ -5,6 +5,7 @@ use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_core::cuda_backend::WrapErr;
 use candle_core::{CudaStorage, DType, Layout, Result, Storage, Tensor};
+use std::sync::Arc;
 
 // Re-export workspace functions and constants for backward compatibility with external callers
 #[allow(unused_imports)]
@@ -393,7 +394,7 @@ pub struct FlashInferDecodeWithPlan {
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub sm_scale: f32,
-    pub plan_info: Vec<i64>, // length 10
+    pub plan_info: Arc<Vec<i64>>, // length 10
     pub enable_cuda_graph: bool,
     pub window_left: i32,
     pub logits_soft_cap: f32,
@@ -613,6 +614,48 @@ pub fn decode_with_plan(
     window_left: Option<i32>,
     logits_soft_cap: Option<f32>,
 ) -> Result<Tensor> {
+    decode_with_plan_shared(
+        q,
+        key_cache,
+        value_cache,
+        k_scale,
+        v_scale,
+        indices,
+        indptr,
+        last_len,
+        block_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        sm_scale,
+        Arc::new(plan_info.to_vec()),
+        enable_cuda_graph,
+        window_left,
+        logits_soft_cap,
+    )
+}
+
+/// Runs decode while retaining the caller's immutable plan owner.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_with_plan_shared(
+    q: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    k_scale: Option<&Tensor>,
+    v_scale: Option<&Tensor>,
+    indices: &Tensor,
+    indptr: &Tensor,
+    last_len: &Tensor,
+    block_size: usize,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sm_scale: f32,
+    plan_info: Arc<Vec<i64>>,
+    enable_cuda_graph: bool,
+    window_left: Option<i32>,
+    logits_soft_cap: Option<f32>,
+) -> Result<Tensor> {
     let op = FlashInferDecodeWithPlan {
         key_cache: key_cache.clone(),
         value_cache: value_cache.clone(),
@@ -626,7 +669,7 @@ pub fn decode_with_plan(
         num_kv_heads,
         head_dim,
         sm_scale,
-        plan_info: plan_info.to_vec(),
+        plan_info,
         enable_cuda_graph,
         window_left: window_left.unwrap_or(-1),
         logits_soft_cap: logits_soft_cap.unwrap_or(0.0f32),
