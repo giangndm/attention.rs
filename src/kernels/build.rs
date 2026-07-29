@@ -12,7 +12,6 @@ use std::{
 
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-env-changed=ATTENTION_RS_FLASHINFER_DECODE_MIN_CHUNK_PAGES");
     println!("cargo:rerun-if-changed=trtllm_artifacts.rs");
     println!("cargo:rerun-if-changed=src/pagedattention.cuh");
     println!("cargo:rerun-if-changed=src/prefill_paged_attn.cu");
@@ -105,14 +104,6 @@ fn main() -> Result<()> {
 
     let flash_enabled = std::env::var("CARGO_FEATURE_FLASH").is_ok();
     let flashinfer_enabled = std::env::var("CARGO_FEATURE_FLASHINFER").is_ok();
-
-    if let Ok(value) = std::env::var("ATTENTION_RS_FLASHINFER_DECODE_MIN_CHUNK_PAGES") {
-        if !matches!(value.as_str(), "4" | "8" | "16") {
-            bail!(
-                "ATTENTION_RS_FLASHINFER_DECODE_MIN_CHUNK_PAGES must be one of 4, 8, or 16; got {value}"
-            );
-        }
-    }
 
     if !trtllm_enabled {
         builder = builder.exclude(&["trtllm/*"]);
