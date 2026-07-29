@@ -1,6 +1,14 @@
 use core::ffi::{c_int, c_long, c_void};
 #[allow(dead_code)]
 extern "C" {
+    pub fn greedy_argmax_f32(
+        logits: *const f32,
+        output: *mut u32,
+        batch: c_int,
+        vocab: c_int,
+        stream: i64,
+    ) -> c_int;
+
     pub fn copy_kv_cache_block_raw(
         key_source: *const c_void,
         key_destination: *mut c_void,

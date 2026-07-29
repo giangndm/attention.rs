@@ -5,9 +5,96 @@ use kernels::ffi;
 use metal;
 pub struct Sampler;
 
+#[cfg(feature = "cuda")]
+fn greedy_scratch_bytes(batch: usize) -> Result<usize> {
+    const STAGE_ONE_BLOCKS: usize = 256;
+    const PAIR_BYTES: usize = std::mem::size_of::<f32>() + std::mem::size_of::<u32>();
+
+    batch
+        .checked_mul(STAGE_ONE_BLOCKS)
+        .and_then(|elements| elements.checked_mul(PAIR_BYTES))
+        .ok_or_else(|| {
+            candle_core::Error::Msg("greedy_cuda scratch byte count overflows usize".into())
+        })
+}
+
 impl Sampler {
     pub fn new() -> Self {
         Self
+    }
+
+    /// Returns the greedy token for each row of eligible exact-width logits.
+    ///
+    /// This deliberately narrow CUDA path preserves the pinned Candle argmax
+    /// tie order. Callers must use their general sampler for every other shape,
+    /// dtype, device, or layout. NaN equivalence is unspecified; callers must
+    /// ensure logits are finite when exact model-output parity is required.
+    #[cfg(feature = "cuda")]
+    pub fn greedy_cuda(&self, logits: &Tensor) -> Result<Vec<u32>> {
+        use candle_core::cuda_backend::cudarc::driver::{DevicePtr, DeviceSlice};
+        use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
+        use candle_core::DType;
+
+        const VOCAB: usize = 151_936;
+
+        let (batch, vocab) = logits.dims2()?;
+        if batch == 0 {
+            candle_core::bail!("greedy_cuda requires a nonempty batch")
+        }
+        if vocab != VOCAB {
+            candle_core::bail!("greedy_cuda requires vocab width {VOCAB}, got {vocab}")
+        }
+        if logits.dtype() != DType::F32 {
+            candle_core::bail!("greedy_cuda requires F32 logits, got {:?}", logits.dtype())
+        }
+        if !logits.is_contiguous() {
+            candle_core::bail!("greedy_cuda requires contiguous logits")
+        }
+
+        greedy_scratch_bytes(batch)?;
+        let batch_i32 = i32::try_from(batch)
+            .map_err(|_| candle_core::Error::Msg("greedy_cuda batch exceeds i32".into()))?;
+        // CUDA grid.y is limited to 65,535 on supported devices.
+        if batch > u16::MAX as usize {
+            candle_core::bail!("greedy_cuda batch exceeds CUDA grid.y limit")
+        }
+        let dev = logits
+            .device()
+            .as_cuda_device()
+            .map_err(|_| candle_core::Error::Msg("greedy_cuda requires CUDA logits".into()))?;
+        let (storage, layout) = logits.storage_and_layout();
+        let logits_slice = match &*storage {
+            candle_core::Storage::Cuda(storage) => match &storage.slice {
+                CudaStorageSlice::F32(slice) => slice,
+                _ => candle_core::bail!("greedy_cuda F32 storage mismatch"),
+            },
+            _ => candle_core::bail!("greedy_cuda requires CUDA storage"),
+        };
+        let view_end = layout
+            .start_offset()
+            .checked_add(logits.elem_count())
+            .ok_or_else(|| candle_core::Error::Msg("greedy_cuda view range overflows".into()))?;
+        if view_end > logits_slice.len() {
+            candle_core::bail!("greedy_cuda view exceeds its CUDA storage")
+        }
+        let logits_view = logits_slice.slice(layout.start_offset()..view_end);
+        let output = unsafe { dev.alloc::<u32>(batch) }.w()?;
+        let status = unsafe {
+            ffi::greedy_argmax_f32(
+                *logits_view.device_ptr() as *const f32,
+                *output.device_ptr() as *mut u32,
+                batch_i32,
+                VOCAB as i32,
+                *dev.cu_stream() as i64,
+            )
+        };
+        if status != 0 {
+            candle_core::bail!("greedy_cuda CUDA operation failed with status {status}")
+        }
+
+        let mut host_output = vec![0u32; batch];
+        dev.dtoh_sync_copy_into(&output, &mut host_output).w()?;
+        Ok(host_output)
     }
 
     #[cfg(feature = "cuda")]
@@ -133,6 +220,16 @@ impl Sampler {
     #[cfg(feature = "metal")]
     pub fn sample(&self, _: &Tensor, _: usize, _: f32, _: f32, _: u64) -> Result<Vec<u32>> {
         candle_core::bail!("Sampler requires CUDA or Metal device")
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod greedy_tests {
+    use super::greedy_scratch_bytes;
+
+    #[test]
+    fn greedy_scratch_bytes_rejects_overflow() {
+        assert!(greedy_scratch_bytes(usize::MAX).is_err());
     }
 }
 
