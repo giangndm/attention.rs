@@ -6,7 +6,9 @@ namespace {
 
 constexpr uint32_t kHeadDim = 128;
 constexpr uint32_t kHalfDim = kHeadDim / 2;
-constexpr uint32_t kThreads = kHeadDim;
+// Each lane owns a RoPE pair (i, i + 64). This halves the block count and
+// avoids loading the paired channel a second time in the rotation stage.
+constexpr uint32_t kThreads = kHalfDim;
 
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
@@ -36,9 +38,10 @@ __global__ __launch_bounds__(kThreads) void qk_rmsnorm_rope_bf16_kernel(
   const uint64_t source_head = is_q ? local_head : q_heads + local_head;
   const uint64_t source_index = static_cast<uint64_t>(token) * row_width +
                                 source_head * kHeadDim + channel;
-  const float source = __bfloat162float(qkv[source_index]);
+  const float source_lo = __bfloat162float(qkv[source_index]);
+  const float source_hi = __bfloat162float(qkv[source_index + kHalfDim]);
 
-  float sum = warp_sum(source * source);
+  float sum = warp_sum(source_lo * source_lo + source_hi * source_hi);
   if ((channel & 31u) == 0u) {
     warp_sums[channel / 32u] = sum;
   }
@@ -61,31 +64,30 @@ __global__ __launch_bounds__(kThreads) void qk_rmsnorm_rope_bf16_kernel(
   if (position < 0 || static_cast<uint64_t>(position) >= max_position) {
     if (is_q) {
       q_output[output_index] = __float2bfloat16_rn(0.0f);
+      q_output[output_index + kHalfDim] = __float2bfloat16_rn(0.0f);
     } else {
       k_output[output_index] = __float2bfloat16_rn(0.0f);
+      k_output[output_index + kHalfDim] = __float2bfloat16_rn(0.0f);
     }
     return;
   }
 
   const float inverse_rms = rsqrtf(warp_sums[0] / kHeadDim + eps);
-  const uint32_t pair_channel =
-      channel < kHalfDim ? channel + kHalfDim : channel - kHalfDim;
-  const uint64_t pair_index = source_index - channel + pair_channel;
   const float *weight = is_q ? q_weight : k_weight;
-  const float value = source * inverse_rms * weight[channel];
-  const float pair =
-      __bfloat162float(qkv[pair_index]) * inverse_rms * weight[pair_channel];
-  const uint32_t rotary_channel = channel < kHalfDim ? channel : pair_channel;
+  const float value_lo = source_lo * inverse_rms * weight[channel];
+  const float value_hi = source_hi * inverse_rms * weight[channel + kHalfDim];
   const uint64_t table_index =
-      static_cast<uint64_t>(position) * kHalfDim + rotary_channel;
+      static_cast<uint64_t>(position) * kHalfDim + channel;
   const float cosine = cos[table_index];
   const float sine = sin[table_index];
-  const float rotated = channel < kHalfDim ? value * cosine - pair * sine
-                                           : value * cosine + pair * sine;
+  const float rotated_lo = value_lo * cosine - value_hi * sine;
+  const float rotated_hi = value_hi * cosine + value_lo * sine;
   if (is_q) {
-    q_output[output_index] = __float2bfloat16_rn(rotated);
+    q_output[output_index] = __float2bfloat16_rn(rotated_lo);
+    q_output[output_index + kHalfDim] = __float2bfloat16_rn(rotated_hi);
   } else {
-    k_output[output_index] = __float2bfloat16_rn(rotated);
+    k_output[output_index] = __float2bfloat16_rn(rotated_lo);
+    k_output[output_index + kHalfDim] = __float2bfloat16_rn(rotated_hi);
   }
 }
 

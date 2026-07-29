@@ -56,9 +56,13 @@ pub const GEMM_SCRATCH_FLOAT_OFFSET: usize = FLASHINFER_PLAN_FLOAT_SIZE;
 /// Size of the GEMM scratch region (used by CUTLASS operations).
 pub const GEMM_SCRATCH_FLOAT_SIZE: usize = 256 * 1024 * 1024;
 
-/// Fallback workspace size when flashinfer is disabled.
+/// Minimal reusable workspace for runners that report no scratch requirement.
+///
+/// NVFP4 GEMM on Blackwell reports zero bytes here. Reserving 512 MiB in
+/// that case makes a 32 GiB card unable to run a model that otherwise fits;
+/// requests with a real non-zero requirement still grow this buffer.
 #[cfg(feature = "cuda")]
-pub const CUTLASS_WORKSPACE_FALLBACK_SIZE: usize = 512 * 1024 * 1024;
+pub const CUTLASS_WORKSPACE_FALLBACK_SIZE: usize = 16 * 1024 * 1024;
 
 /// Describes a region within a workspace buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

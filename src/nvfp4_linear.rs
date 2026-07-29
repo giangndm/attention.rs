@@ -9,10 +9,16 @@ use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 #[cfg(feature = "cuda")]
 use candle_core::DType;
 use candle_core::{Result, Tensor};
+use candle_nn::{Module, RmsNorm};
 
 pub const NVFP4_BLOCK_SIZE: usize = 16;
 const WARP_SIZE: usize = 32;
 const SMALLM_TILE_K: usize = 8_192;
+
+fn use_flashinfer_nvfp4_prefill() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("XINFER_ENABLE_FLASHINFER_NVFP4").is_some())
+}
 
 /// Kernel selected for single-token NVFP4 decode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,70 +239,62 @@ unsafe fn launch_grouped_smallm(
             force_lut,
             stream,
         ),
-        (GroupedDecodeKernel::Tiled(2), DType::F16) => {
-            ffi::nvfp4_matmul_smallm_tiled_rows2_f16(
-                input,
-                weight,
-                scale,
-                weight_global_scale,
-                bias,
-                output,
-                m,
-                n,
-                k,
-                has_bias,
-                force_lut,
-                stream,
-            )
-        }
-        (GroupedDecodeKernel::Tiled(2), DType::BF16) => {
-            ffi::nvfp4_matmul_smallm_tiled_rows2_bf16(
-                input,
-                weight,
-                scale,
-                weight_global_scale,
-                bias,
-                output,
-                m,
-                n,
-                k,
-                has_bias,
-                force_lut,
-                stream,
-            )
-        }
-        (GroupedDecodeKernel::Tiled(3), DType::F16) => {
-            ffi::nvfp4_matmul_smallm_tiled_rows3_f16(
-                input,
-                weight,
-                scale,
-                weight_global_scale,
-                bias,
-                output,
-                m,
-                n,
-                k,
-                has_bias,
-                force_lut,
-                stream,
-            )
-        }
-        (GroupedDecodeKernel::Tiled(3), DType::BF16) => {
-            ffi::nvfp4_matmul_smallm_tiled_rows3_bf16(
-                input,
-                weight,
-                scale,
-                weight_global_scale,
-                bias,
-                output,
-                m,
-                n,
-                k,
-                has_bias,
-                force_lut,
-                stream,
-            )
-        }
+        (GroupedDecodeKernel::Tiled(2), DType::F16) => ffi::nvfp4_matmul_smallm_tiled_rows2_f16(
+            input,
+            weight,
+            scale,
+            weight_global_scale,
+            bias,
+            output,
+            m,
+            n,
+            k,
+            has_bias,
+            force_lut,
+            stream,
+        ),
+        (GroupedDecodeKernel::Tiled(2), DType::BF16) => ffi::nvfp4_matmul_smallm_tiled_rows2_bf16(
+            input,
+            weight,
+            scale,
+            weight_global_scale,
+            bias,
+            output,
+            m,
+            n,
+            k,
+            has_bias,
+            force_lut,
+            stream,
+        ),
+        (GroupedDecodeKernel::Tiled(3), DType::F16) => ffi::nvfp4_matmul_smallm_tiled_rows3_f16(
+            input,
+            weight,
+            scale,
+            weight_global_scale,
+            bias,
+            output,
+            m,
+            n,
+            k,
+            has_bias,
+            force_lut,
+            stream,
+        ),
+        (GroupedDecodeKernel::Tiled(3), DType::BF16) => ffi::nvfp4_matmul_smallm_tiled_rows3_bf16(
+            input,
+            weight,
+            scale,
+            weight_global_scale,
+            bias,
+            output,
+            m,
+            n,
+            k,
+            has_bias,
+            force_lut,
+            stream,
+        ),
         _ => candle_core::bail!(
             "NVFP4 grouped small-M has no compiled route for M={m}, dtype={dtype:?}, kernel={kernel:?}"
         ),
@@ -402,6 +400,101 @@ fn is_hardware_fp4_available(dev: &candle_core::Device) -> bool {
         sm >= 100
     } else {
         false
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn can_fuse_silu_quantization(gate_up: &Tensor, weight: &Tensor, is_prefill: bool) -> bool {
+    if !cfg!(feature = "cutlass")
+        || !is_prefill
+        || use_flashinfer_nvfp4_prefill()
+        || gate_up.dtype() != DType::BF16
+        || !gate_up.is_contiguous()
+        || gate_up.rank() != 2
+    {
+        return false;
+    }
+    let start_offset = {
+        let (_storage, layout) = gate_up.storage_and_layout();
+        layout.start_offset()
+    };
+    if start_offset != 0 {
+        return false;
+    }
+    let Some(&doubled_k) = gate_up.dims().last() else {
+        return false;
+    };
+    if doubled_k % 2 != 0 {
+        return false;
+    }
+    let k = doubled_k / 2;
+    let Some(&n) = weight.dims().first() else {
+        return false;
+    };
+    let Ok(cuda_dev) = gate_up.device().as_cuda_device() else {
+        return false;
+    };
+    crate::cuda_utils::sm_version(cuda_dev).unwrap_or(0) == 120 && k % 32 == 0 && n % 32 == 0
+}
+
+#[cfg(feature = "cuda")]
+fn can_fuse_rms_norm_quantization(
+    input: &Tensor,
+    norm_weight: &Tensor,
+    weight: &Tensor,
+    eps: f64,
+    is_prefill: bool,
+) -> bool {
+    if !cfg!(feature = "cutlass")
+        || !is_prefill
+        || use_flashinfer_nvfp4_prefill()
+        || input.dtype() != DType::BF16
+        || norm_weight.dtype() != DType::BF16
+        || !input.is_contiguous()
+        || !norm_weight.is_contiguous()
+        || input.rank() == 0
+        || !eps.is_finite()
+        || eps < 0.0
+        || !(eps as f32).is_finite()
+    {
+        return false;
+    }
+    let input_offset = input.storage_and_layout().1.start_offset();
+    let weight_offset = norm_weight.storage_and_layout().1.start_offset();
+    if input_offset != 0 || weight_offset != 0 {
+        return false;
+    }
+    let Some(&k) = input.dims().last() else {
+        return false;
+    };
+    let Some(rows) = input.elem_count().checked_div(k) else {
+        return false;
+    };
+    if rows < 128 || k % 128 != 0 || norm_weight.dims() != [k] {
+        return false;
+    }
+    let &[n, packed_k] = weight.dims() else {
+        return false;
+    };
+    if packed_k != k / 2 || n % 32 != 0 || !input.device().same_device(norm_weight.device()) {
+        return false;
+    }
+    let Ok(cuda_dev) = input.device().as_cuda_device() else {
+        return false;
+    };
+    crate::cuda_utils::sm_version(cuda_dev).unwrap_or(0) == 120
+}
+
+fn materialized_silu_and_mul(gate_up: &Tensor, half_dim: usize) -> Result<Tensor> {
+    let start_offset = {
+        let (_storage, layout) = gate_up.storage_and_layout();
+        layout.start_offset()
+    };
+    if start_offset == 0 {
+        crate::silu_and_mul::silu_and_mul(gate_up, half_dim)
+    } else {
+        let zero_offset = gate_up.force_contiguous()?;
+        crate::silu_and_mul::silu_and_mul(&zero_offset, half_dim)
     }
 }
 
@@ -543,6 +636,33 @@ pub fn nvfp4_matmul(
     is_prefill: bool,
     weight_scale_swizzled: Option<&Tensor>,
 ) -> Result<Tensor> {
+    nvfp4_matmul_impl(
+        input,
+        weight,
+        scale,
+        weight_global_scale,
+        input_scale,
+        bias,
+        is_prefill,
+        weight_scale_swizzled,
+        false,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nvfp4_matmul_impl(
+    input: &Tensor,
+    weight: &Tensor,
+    scale: &Tensor,
+    weight_global_scale: f32,
+    input_scale: f32,
+    bias: Option<&Tensor>,
+    is_prefill: bool,
+    weight_scale_swizzled: Option<&Tensor>,
+    fuse_swiglu: bool,
+    rms_norm: Option<(&Tensor, f32)>,
+) -> Result<Tensor> {
     let input = if input.is_contiguous() {
         input.clone()
     } else {
@@ -567,7 +687,11 @@ pub fn nvfp4_matmul(
     }
 
     let m = input_dims[0];
-    let k = input_dims[1];
+    let input_k = input_dims[1];
+    if fuse_swiglu && input_k % 2 != 0 {
+        candle_core::bail!("NVFP4 fused SiLU input width must be even, got {input_k}");
+    }
+    let k = if fuse_swiglu { input_k / 2 } else { input_k };
     let n = weight_dims[0];
 
     if k % NVFP4_BLOCK_SIZE != 0 {
@@ -604,6 +728,7 @@ pub fn nvfp4_matmul(
             }
 
             let use_flashinfer_fp4 = cfg!(feature = "flashinfer")
+                && use_flashinfer_nvfp4_prefill()
                 && is_flashinfer_fp4_available(dev)
                 && is_prefill
                 && n % 32 == 0
@@ -652,7 +777,12 @@ pub fn nvfp4_matmul(
                     let k_scale_padded = pad_to(k_scale_cols, 4);
                     let n_padded = pad_to(n, 128);
 
-                    let decode_scratch = if decode_kernel == Some(DecodeKernel::HardwareFp4) {
+                    // Hardware FP4 prefill and decode consume quantization and
+                    // GEMM serially on one stream, so they can share this
+                    // grow-only scratch pool. This avoids three device-buffer
+                    // allocations (and their initialization copies) per dense
+                    // prefill projection.
+                    let decode_scratch = if use_hardware_fp4 {
                         Some(get_nvfp4_decode_scratch(cuda_dev, m, k)?)
                     } else {
                         None
@@ -744,11 +874,28 @@ pub fn nvfp4_matmul(
                         let alpha_ptr = cuda_ptr(&alpha_s, DType::F32)? as *const f32;
 
                         unsafe {
-                            match dtype {
-                                DType::F16 => ffi::nvfp4_quantize_activation_f16(
+                            if let Some((norm_weight, eps)) = rms_norm {
+                                let (norm_weight_s, _) = norm_weight.storage_and_layout();
+                                let norm_weight_ptr = cuda_ptr(&norm_weight_s, DType::BF16)?
+                                    as *const std::ffi::c_void;
+                                let status = ffi::nvfp4_quantize_rms_norm_bf16(
+                                    input_ptr,
+                                    norm_weight_ptr,
+                                    act_packed_ptr,
+                                    act_scales_sw_ptr,
+                                    eps,
+                                    hw_input_scale_inv,
+                                    m as i32,
+                                    k as i32,
+                                    m_padded as i32,
+                                    k_scale_padded as i32,
+                                    stream,
+                                );
+                                cuda_launch_status(status, "nvfp4_quantize_rms_norm_bf16")?;
+                            } else if fuse_swiglu {
+                                let status = ffi::nvfp4_quantize_silu_and_mul_bf16(
                                     input_ptr,
                                     act_packed_ptr,
-                                    act_scales_ptr,
                                     act_scales_sw_ptr,
                                     hw_input_scale_inv,
                                     m as i32,
@@ -756,23 +903,39 @@ pub fn nvfp4_matmul(
                                     m_padded as i32,
                                     k_scale_padded as i32,
                                     stream,
-                                ),
-                                DType::BF16 => ffi::nvfp4_quantize_activation_bf16(
-                                    input_ptr,
-                                    act_packed_ptr,
-                                    act_scales_ptr,
-                                    act_scales_sw_ptr,
-                                    hw_input_scale_inv,
-                                    m as i32,
-                                    k as i32,
-                                    m_padded as i32,
-                                    k_scale_padded as i32,
-                                    stream,
-                                ),
-                                _ => candle_core::bail!(
-                                    "nvfp4_matmul: unsupported dtype {:?}",
-                                    dtype
-                                ),
+                                );
+                                cuda_launch_status(status, "nvfp4_quantize_silu_and_mul_bf16")?;
+                            } else {
+                                match dtype {
+                                    DType::F16 => ffi::nvfp4_quantize_activation_f16(
+                                        input_ptr,
+                                        act_packed_ptr,
+                                        act_scales_ptr,
+                                        act_scales_sw_ptr,
+                                        hw_input_scale_inv,
+                                        m as i32,
+                                        k as i32,
+                                        m_padded as i32,
+                                        k_scale_padded as i32,
+                                        stream,
+                                    ),
+                                    DType::BF16 => ffi::nvfp4_quantize_activation_bf16(
+                                        input_ptr,
+                                        act_packed_ptr,
+                                        act_scales_ptr,
+                                        act_scales_sw_ptr,
+                                        hw_input_scale_inv,
+                                        m as i32,
+                                        k as i32,
+                                        m_padded as i32,
+                                        k_scale_padded as i32,
+                                        stream,
+                                    ),
+                                    _ => candle_core::bail!(
+                                        "nvfp4_matmul: unsupported dtype {:?}",
+                                        dtype
+                                    ),
+                                }
                             }
 
                             if weight_scale_swizzled.is_none() {
@@ -1156,6 +1319,105 @@ pub fn nvfp4_matmul(
         }
         _ => candle_core::bail!("nvfp4_matmul: unsupported backend (need CUDA or Metal)"),
     }
+}
+
+/// Fuses BF16 RMSNorm rounding with NVFP4 activation quantization for eligible
+/// SM120 prefills. Other dtypes, devices, layouts, and decode calls retain the
+/// materialized Candle RMSNorm fallback.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_matmul_rms_norm(
+    input: &Tensor,
+    norm_weight: &Tensor,
+    eps: f64,
+    weight: &Tensor,
+    scale: &Tensor,
+    weight_global_scale: f32,
+    input_scale: f32,
+    bias: Option<&Tensor>,
+    is_prefill: bool,
+    weight_scale_swizzled: Option<&Tensor>,
+) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if can_fuse_rms_norm_quantization(input, norm_weight, weight, eps, is_prefill) {
+        let width = input.dim(input.rank() - 1)?;
+        let rows = input.elem_count() / width;
+        return nvfp4_matmul_impl(
+            &input.reshape((rows, width))?,
+            weight,
+            scale,
+            weight_global_scale,
+            input_scale,
+            bias,
+            is_prefill,
+            weight_scale_swizzled,
+            false,
+            Some((norm_weight, eps as f32)),
+        );
+    }
+    let normalized = RmsNorm::new(norm_weight.clone(), eps).forward(input)?;
+    let rows = normalized.dims()[..normalized.rank() - 1]
+        .iter()
+        .try_fold(1usize, |rows, &dim| rows.checked_mul(dim))
+        .ok_or_else(|| candle_core::Error::Msg("NVFP4 RMSNorm row count overflows usize".into()))?;
+    let width = normalized.dim(normalized.rank() - 1)?;
+    nvfp4_matmul(
+        &normalized.reshape((rows, width))?,
+        weight,
+        scale,
+        weight_global_scale,
+        input_scale,
+        bias,
+        is_prefill,
+        weight_scale_swizzled,
+    )
+}
+
+/// Fuses the public SiLU-and-multiply operation with the existing NVFP4 GEMM
+/// dispatch at the API boundary. The GEMM itself remains on the selected
+/// Blackwell hardware FP4 route for eligible prefill dimensions.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_matmul_silu_and_mul(
+    gate_up: &Tensor,
+    weight: &Tensor,
+    scale: &Tensor,
+    weight_global_scale: f32,
+    input_scale: f32,
+    is_prefill: bool,
+    weight_scale_swizzled: Option<&Tensor>,
+) -> Result<Tensor> {
+    let doubled_dim = gate_up.dims().last().copied().ok_or_else(|| {
+        candle_core::Error::msg("nvfp4 fused SiLU input must have a last dimension")
+    })?;
+    if doubled_dim % 2 != 0 {
+        candle_core::bail!("nvfp4 fused SiLU input width must be even, got {doubled_dim}");
+    }
+    let half_dim = doubled_dim / 2;
+    #[cfg(feature = "cuda")]
+    if can_fuse_silu_quantization(gate_up, weight, is_prefill) {
+        return nvfp4_matmul_impl(
+            gate_up,
+            weight,
+            scale,
+            weight_global_scale,
+            input_scale,
+            None,
+            is_prefill,
+            weight_scale_swizzled,
+            true,
+            None,
+        );
+    }
+    let activated = materialized_silu_and_mul(gate_up, half_dim)?;
+    nvfp4_matmul(
+        &activated,
+        weight,
+        scale,
+        weight_global_scale,
+        input_scale,
+        None,
+        is_prefill,
+        weight_scale_swizzled,
+    )
 }
 
 /// Repack MLX NVFP4 weights from U32 to U8 on GPU.
@@ -1990,4 +2252,234 @@ fn mlx_dequant_embedding_metal(
         .map_err(candle_core::Error::wrap)?;
     }
     Ok(output)
+}
+
+#[cfg(all(test, feature = "cuda", feature = "cutlass"))]
+fn test_cuda_ptr(tensor: &Tensor) -> Result<u64> {
+    use candle_core::Storage;
+
+    let (storage, _) = tensor.storage_and_layout();
+    match (&*storage, tensor.dtype()) {
+        (Storage::Cuda(storage), DType::BF16) => {
+            Ok(*storage.as_cuda_slice::<half::bf16>()?.device_ptr())
+        }
+        (Storage::Cuda(storage), DType::U8) => Ok(*storage.as_cuda_slice::<u8>()?.device_ptr()),
+        _ => candle_core::bail!("SiLU quantization test oracle requires CUDA BF16/U8 tensors"),
+    }
+}
+
+#[cfg(all(test, feature = "cuda", feature = "cutlass"))]
+fn quantize_silu_and_mul_bf16_for_test(
+    gate_up: &Tensor,
+    input_scale: f32,
+) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+    let [m, doubled_k] = gate_up.dims() else {
+        candle_core::bail!("SiLU quantization test oracle requires rank-two gate/up input");
+    };
+    if gate_up.dtype() != DType::BF16 || doubled_k % 2 != 0 || input_scale <= 1e-12 {
+        candle_core::bail!("SiLU quantization test oracle received an invalid BF16 contract");
+    }
+    let k = doubled_k / 2;
+    let m_padded = pad_to(*m, 128);
+    let k_scale_cols = k / NVFP4_BLOCK_SIZE;
+    let k_scale_padded = pad_to(k_scale_cols, 4);
+    let device = gate_up.device();
+    let stream = *device.as_cuda_device()?.cu_stream() as i64;
+
+    let candidate_packed = Tensor::zeros((*m, k / 2), DType::U8, device)?;
+    let candidate_scales = Tensor::zeros((m_padded, k_scale_padded), DType::U8, device)?;
+    let reference_packed = Tensor::zeros((*m, k / 2), DType::U8, device)?;
+    let reference_linear_scales = Tensor::zeros((m_padded, k_scale_cols), DType::U8, device)?;
+    let reference_scales = Tensor::zeros((m_padded, k_scale_padded), DType::U8, device)?;
+    let activated = crate::silu_and_mul::silu_and_mul(gate_up, k)?;
+
+    unsafe {
+        let status = ffi::nvfp4_quantize_silu_and_mul_bf16(
+            test_cuda_ptr(gate_up)? as *const std::ffi::c_void,
+            test_cuda_ptr(&candidate_packed)? as *mut std::ffi::c_void,
+            test_cuda_ptr(&candidate_scales)? as *mut std::ffi::c_void,
+            1.0 / input_scale,
+            *m as i32,
+            k as i32,
+            m_padded as i32,
+            k_scale_padded as i32,
+            stream,
+        );
+        cuda_launch_status(status, "nvfp4_quantize_silu_and_mul_bf16 test oracle")?;
+        ffi::nvfp4_quantize_activation_bf16(
+            test_cuda_ptr(&activated)? as *const std::ffi::c_void,
+            test_cuda_ptr(&reference_packed)? as *mut std::ffi::c_void,
+            test_cuda_ptr(&reference_linear_scales)? as *mut std::ffi::c_void,
+            test_cuda_ptr(&reference_scales)? as *mut std::ffi::c_void,
+            1.0 / input_scale,
+            *m as i32,
+            k as i32,
+            m_padded as i32,
+            k_scale_padded as i32,
+            stream,
+        );
+    }
+    Ok((
+        candidate_packed,
+        candidate_scales,
+        reference_packed,
+        reference_scales,
+    ))
+}
+
+#[cfg(all(test, feature = "cuda", feature = "cutlass"))]
+fn quantize_rms_norm_bf16_for_test(
+    input: &Tensor,
+    norm_weight: &Tensor,
+    eps: f64,
+    input_scale: f32,
+) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+    let &[m, k] = input.dims() else {
+        candle_core::bail!("RMSNorm quantization test oracle requires rank-two input");
+    };
+    if input.dtype() != DType::BF16
+        || norm_weight.dtype() != DType::BF16
+        || norm_weight.dims() != [k]
+        || !input.is_contiguous()
+        || !norm_weight.is_contiguous()
+        || input.storage_and_layout().1.start_offset() != 0
+        || norm_weight.storage_and_layout().1.start_offset() != 0
+        || !eps.is_finite()
+        || eps < 0.0
+        || input_scale <= 1e-12
+        || k % 128 != 0
+    {
+        candle_core::bail!("RMSNorm quantization test oracle received an invalid BF16 contract");
+    }
+    let m_padded = pad_to(m, 128);
+    let k_scale_cols = k / NVFP4_BLOCK_SIZE;
+    let k_scale_padded = pad_to(k_scale_cols, 4);
+    let device = input.device();
+    let stream = *device.as_cuda_device()?.cu_stream() as i64;
+
+    let candidate_packed = Tensor::zeros((m, k / 2), DType::U8, device)?;
+    let candidate_scales = Tensor::zeros((m_padded, k_scale_padded), DType::U8, device)?;
+    let reference_packed = Tensor::zeros((m, k / 2), DType::U8, device)?;
+    let reference_linear_scales = Tensor::zeros((m_padded, k_scale_cols), DType::U8, device)?;
+    let reference_scales = Tensor::zeros((m_padded, k_scale_padded), DType::U8, device)?;
+    let normalized = RmsNorm::new(norm_weight.clone(), eps).forward(input)?;
+
+    unsafe {
+        let status = ffi::nvfp4_quantize_rms_norm_bf16(
+            test_cuda_ptr(input)? as *const std::ffi::c_void,
+            test_cuda_ptr(norm_weight)? as *const std::ffi::c_void,
+            test_cuda_ptr(&candidate_packed)? as *mut std::ffi::c_void,
+            test_cuda_ptr(&candidate_scales)? as *mut std::ffi::c_void,
+            eps as f32,
+            1.0 / input_scale,
+            m as i32,
+            k as i32,
+            m_padded as i32,
+            k_scale_padded as i32,
+            stream,
+        );
+        cuda_launch_status(status, "nvfp4_quantize_rms_norm_bf16 test oracle")?;
+        ffi::nvfp4_quantize_activation_bf16(
+            test_cuda_ptr(&normalized)? as *const std::ffi::c_void,
+            test_cuda_ptr(&reference_packed)? as *mut std::ffi::c_void,
+            test_cuda_ptr(&reference_linear_scales)? as *mut std::ffi::c_void,
+            test_cuda_ptr(&reference_scales)? as *mut std::ffi::c_void,
+            1.0 / input_scale,
+            m as i32,
+            k as i32,
+            m_padded as i32,
+            k_scale_padded as i32,
+            stream,
+        );
+    }
+    Ok((
+        candidate_packed,
+        candidate_scales,
+        reference_packed,
+        reference_scales,
+    ))
+}
+
+#[cfg(all(test, feature = "cuda", feature = "cutlass"))]
+mod silu_quantization_tests {
+    use super::quantize_silu_and_mul_bf16_for_test;
+    use candle_core::{DType, Device, Tensor};
+
+    #[test]
+    fn sm120_fused_silu_quantization_matches_materialized_bf16_bytes() -> candle_core::Result<()> {
+        const K: usize = 25_600;
+        let device = Device::new_cuda(0)?;
+        if crate::cuda_utils::sm_version(device.as_cuda_device()?).unwrap_or_default() != 120 {
+            return Ok(());
+        }
+
+        for m in [1, 127, 129] {
+            let values = (0..m * K * 2)
+                .map(|index| ((index.wrapping_mul(37) % 509) as f32 - 254.0) / 41.0)
+                .collect::<Vec<_>>();
+            let gate_up = Tensor::from_vec(values, (m, K * 2), &device)?.to_dtype(DType::BF16)?;
+            let (candidate_packed, candidate_scales, reference_packed, reference_scales) =
+                quantize_silu_and_mul_bf16_for_test(&gate_up, 0.8125)?;
+            device.synchronize()?;
+
+            assert_eq!(
+                candidate_packed.flatten_all()?.to_vec1::<u8>()?,
+                reference_packed.flatten_all()?.to_vec1::<u8>()?,
+                "M={m}: packed E2M1 bytes differ"
+            );
+            assert_eq!(
+                candidate_scales.flatten_all()?.to_vec1::<u8>()?,
+                reference_scales.flatten_all()?.to_vec1::<u8>()?,
+                "M={m}: CUTLASS-swizzled E4M3 scale bytes differ"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "cuda", feature = "cutlass"))]
+mod rms_norm_quantization_tests {
+    use super::quantize_rms_norm_bf16_for_test;
+    use candle_core::{DType, Device, Tensor};
+
+    #[test]
+    fn sm120_fused_rms_norm_quantization_matches_materialized_bf16_bytes() -> candle_core::Result<()>
+    {
+        const K: usize = 5_120;
+        const EPS: f64 = 1e-6;
+        let device = Device::new_cuda(0)?;
+        if crate::cuda_utils::sm_version(device.as_cuda_device()?).unwrap_or_default() != 120 {
+            return Ok(());
+        }
+
+        let norm_weight = Tensor::from_vec(
+            (0..K)
+                .map(|index| 0.75 + (index % 17) as f32 * 0.015625)
+                .collect::<Vec<_>>(),
+            K,
+            &device,
+        )?
+        .to_dtype(DType::BF16)?;
+        for m in [127, 128, 129] {
+            let values = (0..m * K)
+                .map(|index| ((index.wrapping_mul(37) % 509) as f32 - 254.0) / 41.0)
+                .collect::<Vec<_>>();
+            let input = Tensor::from_vec(values, (m, K), &device)?.to_dtype(DType::BF16)?;
+            let (candidate_packed, candidate_scales, reference_packed, reference_scales) =
+                quantize_rms_norm_bf16_for_test(&input, &norm_weight, EPS, 0.8125)?;
+            device.synchronize()?;
+
+            assert_eq!(
+                candidate_packed.flatten_all()?.to_vec1::<u8>()?,
+                reference_packed.flatten_all()?.to_vec1::<u8>()?,
+                "M={m}: packed E2M1 bytes differ"
+            );
+            assert_eq!(
+                candidate_scales.flatten_all()?.to_vec1::<u8>()?,
+                reference_scales.flatten_all()?.to_vec1::<u8>()?,
+                "M={m}: CUTLASS-swizzled E4M3 scale bytes differ"
+            );
+        }
+        Ok(())
+    }
 }

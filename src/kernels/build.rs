@@ -1,8 +1,12 @@
 mod trtllm_artifacts;
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use cudaforge::KernelBuilder;
-use std::path::PathBuf;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
@@ -78,6 +82,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/flash/flash_prefill_tq4.cuh");
     println!("cargo:rerun-if-changed=src/flash/flash_prefill_tq3.cuh");
     println!("cargo:rerun-if-changed=src/flash/flash_sm_compat.cuh");
+    println!("cargo:rerun-if-changed=patches/flashinfer-fp8-paged-repack.patch");
 
     let marlin_disabled = std::env::var("CARGO_FEATURE_NO_MARLIN").is_ok();
     let fp8_kvcache_disabled = std::env::var("CARGO_FEATURE_NO_FP8_KVCACHE").is_ok();
@@ -87,22 +92,36 @@ fn main() -> Result<()> {
 
     let mut builder = KernelBuilder::new()
         .source_dir("src")
+        // Keep the native Flash templates in their own archive.  They change
+        // frequently while tuning attention, whereas the CUTLASS/NVFP4 units
+        // are expensive and otherwise unrelated.
+        .exclude(&["flash/*"])
         .nvcc_thread_patterns(&["flash_api", "flash_decode", "cutlass", "flashinfer"], 2)
+        .max_threads(8)
         .arg("--expt-relaxed-constexpr")
         .arg("-O3");
 
     let flash_enabled = std::env::var("CARGO_FEATURE_FLASH").is_ok();
+    let flashinfer_enabled = std::env::var("CARGO_FEATURE_FLASHINFER").is_ok();
 
     if !trtllm_enabled {
         builder = builder.exclude(&["trtllm/*"]);
     }
 
+    // Avoid compiling optional FlashInfer adapters in native-Flash builds.
+    // Their CUTLASS-heavy translation units are not reachable without the
+    // feature and otherwise make each clean build substantially slower.
+    if !flashinfer_enabled {
+        builder = builder.exclude(&[
+            "flashinfer_*",
+            "gdn_flashinfer_prefill.cu",
+            "nvfp4_gemm_flashinfer.cu",
+        ]);
+    }
+
     let compute_cap = builder.get_compute_cap().unwrap_or(80);
 
-    if !flash_enabled {
-        builder = builder.exclude(&["flash/*"]);
-    } else {
-        builder = builder.arg("-Isrc/flash");
+    if flash_enabled {
         if compute_cap <= 70 {
             println!(
                 "cargo:warning=Native flash kernels using m8n8k4 Tensor Core MMA for SM{}.",
@@ -140,9 +159,7 @@ fn main() -> Result<()> {
         builder = builder.arg("-DNO_FP8_KVCACHE");
     }
 
-    if std::env::var("CARGO_FEATURE_CUTLASS").is_ok()
-        || std::env::var("CARGO_FEATURE_FLASHINFER").is_ok()
-    {
+    if std::env::var("CARGO_FEATURE_CUTLASS").is_ok() || flashinfer_enabled {
         builder = builder
             .arg("-DUSE_CUTLASS")
             .with_cutlass(Some("da5e086dab31d63815acafdac9a9c5893b1c69e2"));
@@ -159,7 +176,7 @@ fn main() -> Result<()> {
             builder = builder.arg("-DENABLE_FP4_SM120");
         }
 
-        if std::env::var("CARGO_FEATURE_FLASHINFER").is_ok() {
+        if flashinfer_enabled {
             builder = builder.arg("-DENABLE_BF16").arg("-DENABLE_FP8");
             if compute_cap >= 89 {
                 builder = builder.arg("-DFLASHINFER_ENABLE_FP8_E8M0");
@@ -187,7 +204,7 @@ fn main() -> Result<()> {
         }
     }
 
-    if std::env::var("CARGO_FEATURE_FLASHINFER").is_ok() {
+    if flashinfer_enabled {
         println!("cargo:rerun-if-changed=src/flashinfer_common.cuh");
         println!("cargo:rerun-if-changed=src/flashinfer_adapter_decode.cu");
         println!("cargo:rerun-if-changed=src/flashinfer_adapter_prefill.cu");
@@ -215,6 +232,8 @@ fn main() -> Result<()> {
         );
 
         let flashinfer_root = builder.fetch_git_dependency("flashinfer")?;
+        let flashinfer_overlay = prepare_flashinfer_prefill_overlay(&flashinfer_root, &build_dir)?;
+        builder = builder.include_path(flashinfer_overlay.join("include"));
         let csrc_dir = flashinfer_root.join("csrc");
         let trtllm_dir = csrc_dir.join("nv_internal").join("tensorrt_llm");
 
@@ -354,14 +373,102 @@ fn main() -> Result<()> {
         }
     }
 
-    println!("cargo:info={builder:?}");
+    if flash_enabled {
+        let mut flash_builder = KernelBuilder::new()
+            .source_files([
+                "src/flash/flash_instantiate.cu",
+                "src/flash/flash_decode.cu",
+            ])
+            // CudaForge hashes this directory separately from the core archive,
+            // so a Flash header edit recompiles only these two translation units.
+            .watch(["src/flash"])
+            .nvcc_thread_patterns(&["flash_instantiate", "flash_decode"], 2)
+            .max_threads(8)
+            .arg("--expt-relaxed-constexpr")
+            .arg("-O3")
+            .arg("-Isrc/flash");
+
+        if compute_cap < 80 {
+            flash_builder = flash_builder.arg("-DNO_BF16_KERNEL");
+        }
+        if compute_cap < 89 {
+            flash_builder = flash_builder.arg("-DNO_HARDWARE_FP8");
+        }
+        if fp8_kvcache_disabled {
+            flash_builder = flash_builder.arg("-DNO_FP8_KVCACHE");
+        }
+        if !is_target_msvc {
+            flash_builder = flash_builder.arg("-Xcompiler").arg("-fPIC");
+            flash_builder = if compute_cap >= 90 {
+                flash_builder.arg("-std=c++20")
+            } else {
+                flash_builder.arg("-std=c++17")
+            };
+        } else {
+            flash_builder = flash_builder.arg("-D_USE_MATH_DEFINES");
+        }
+
+        println!("cargo:info=native flash: {flash_builder:?}");
+        let _ = flash_builder.build_lib(build_dir.join("libnativeflash.a"))?;
+    }
+
+    println!("cargo:info=core: {builder:?}");
 
     let _ = builder.build_lib(build_dir.join("libpagedattention.a"))?;
 
     println!("cargo:rustc-link-search={}", build_dir.display());
+    if flash_enabled {
+        println!("cargo:rustc-link-lib=nativeflash");
+    }
     println!("cargo:rustc-link-lib=pagedattention");
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=cublas");
 
     Ok(())
+}
+
+fn prepare_flashinfer_prefill_overlay(flashinfer_root: &Path, build_dir: &Path) -> Result<PathBuf> {
+    let patch =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("patches/flashinfer-fp8-paged-repack.patch");
+    let source = flashinfer_root.join("include/flashinfer/attention/prefill.cuh");
+    let overlay = build_dir.join("flashinfer-prefill-overlay");
+    let destination = overlay.join("include/flashinfer/attention/prefill.cuh");
+
+    fs::create_dir_all(
+        destination
+            .parent()
+            .context("overlay header has no parent")?,
+    )
+    .context("failed to create FlashInfer prefill overlay")?;
+    fs::copy(&source, &destination).with_context(|| {
+        format!(
+            "failed to copy pinned FlashInfer header from {}",
+            source.display()
+        )
+    })?;
+
+    for check_only in [true, false] {
+        let mut command = Command::new("git");
+        command
+            .current_dir(std::env::temp_dir())
+            .arg("apply")
+            .arg("--unsafe-paths")
+            .arg(format!("--directory={}", overlay.display()));
+        if check_only {
+            command.arg("--check");
+        }
+        let output = command
+            .arg(&patch)
+            .output()
+            .context("failed to run git apply for FlashInfer overlay")?;
+        if !output.status.success() {
+            bail!(
+                "failed to {} FlashInfer prefill overlay patch: {}",
+                if check_only { "validate" } else { "apply" },
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+    }
+
+    Ok(overlay)
 }

@@ -1626,6 +1626,32 @@ extern "C" {
         stream: i64,
     );
 
+    pub fn nvfp4_quantize_silu_and_mul_bf16(
+        gate_up: *const c_void,
+        output: *mut c_void,
+        swizzled_scales: *mut c_void,
+        input_scale_inv: f32,
+        M: i32,
+        K: i32,
+        M_padded: i32,
+        K_scale_padded: i32,
+        stream: i64,
+    ) -> i32;
+
+    pub fn nvfp4_quantize_rms_norm_bf16(
+        input: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+        swizzled_scales: *mut c_void,
+        eps: f32,
+        input_scale_inv: f32,
+        M: i32,
+        K: i32,
+        M_padded: i32,
+        K_scale_padded: i32,
+        stream: i64,
+    ) -> i32;
+
     pub fn nvfp4_quantize_activation_grouped_f16(
         input: *const c_void,
         output: *mut c_void,

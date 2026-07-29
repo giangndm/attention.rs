@@ -216,13 +216,37 @@ __device__ __forceinline__ uint8_t float_to_fp4_e2m1(float val) {
 
 static constexpr int NVFP4_QUANT_MAX_THREADS = 512;
 
-template <typename InType>
+__device__ __forceinline__ float nvfp4_stable_silu(float value) {
+  if (value >= 0.0f) {
+    return value / (1.0f + expf(-value));
+  }
+  float exponent = expf(value);
+  return value * exponent / (1.0f + exponent);
+}
+
+__device__ __forceinline__ int64_t nvfp4_swizzled_scale_offset(
+    int m_idx, int k_idx, int cols_padded) {
+  int inner_k_idx = k_idx % 4;
+  int inner_m_idx = (m_idx % 128) / 32;
+  int outer_m_idx = m_idx % 32;
+  int k_tile_idx = k_idx / 4;
+  int m_tile_idx = m_idx / 128;
+  int num_k_tiles = (cols_padded + 3) / 4;
+  constexpr int64_t k_tile_stride = 512;
+  int64_t m_tile_stride = static_cast<int64_t>(num_k_tiles) * k_tile_stride;
+  return static_cast<int64_t>(m_tile_idx) * m_tile_stride
+       + static_cast<int64_t>(k_tile_idx) * k_tile_stride
+       + outer_m_idx * 16 + inner_m_idx * 4 + inner_k_idx;
+}
+
+template <typename InType, bool FuseSiluAndMul = false>
 __global__ void nvfp4_quantize_activation_hw_kernel(
-    const InType* __restrict__ input,   // [M, K]
+    const InType* __restrict__ input,   // [M, K], or [M, 2K] when fused
     uint8_t* __restrict__ output,       // [M, K/2] packed FP4
     uint8_t* __restrict__ scales,       // [M_padded, K/16] FP8 E4M3 block scales
     float SFScaleVal,                   // 1/input_scale
-    int M, int K, int M_padded)
+    int M, int K, int M_padded,
+    int K_scale_padded = 0)
 {
   int row = blockIdx.x;
   int num_blocks = K / NVFP4_BLOCK_SIZE;
@@ -239,7 +263,15 @@ __global__ void nvfp4_quantize_activation_hw_kernel(
   for (int i = 0; i < NVFP4_BLOCK_SIZE; i++) {
     int k_idx = k_start + i;
     if (k_idx < K) {
-      vals[i] = static_cast<float>(input[in_base + k_idx]);
+      if constexpr (FuseSiluAndMul) {
+        int64_t gate_idx = static_cast<int64_t>(row) * 2 * K + k_idx;
+        float gate = __bfloat162float(input[gate_idx]);
+        float up = __bfloat162float(input[gate_idx + K]);
+        nv_bfloat16 rounded = __float2bfloat16_rn(nvfp4_stable_silu(gate) * up);
+        vals[i] = __bfloat162float(rounded);
+      } else {
+        vals[i] = static_cast<float>(input[in_base + k_idx]);
+      }
     } else {
       vals[i] = 0.0f;
     }
@@ -282,7 +314,10 @@ __global__ void nvfp4_quantize_activation_hw_kernel(
   reinterpret_cast<uint32_t*>(output + out_base)[0] = packed_lo;
   reinterpret_cast<uint32_t*>(output + out_base)[1] = packed_hi;
 
-  scales[static_cast<int64_t>(row) * num_blocks + block_idx] = fp8_scale_bits;
+  int64_t scale_offset = FuseSiluAndMul
+      ? nvfp4_swizzled_scale_offset(row, block_idx, K_scale_padded)
+      : static_cast<int64_t>(row) * num_blocks + block_idx;
+  scales[scale_offset] = fp8_scale_bits;
 
 #else
   float SFValue = __fdiv_rn(SFScaleVal * vecMax, 6.0f);
@@ -338,10 +373,139 @@ __global__ void nvfp4_quantize_activation_hw_kernel(
     output[out_base + i] = (codes[2 * i + 1] << 4) | codes[2 * i];
   }
 
-  scales[static_cast<int64_t>(row) * num_blocks + block_idx] = fp8_scale_bits;
+  int64_t scale_offset = FuseSiluAndMul
+      ? nvfp4_swizzled_scale_offset(row, block_idx, K_scale_padded)
+      : static_cast<int64_t>(row) * num_blocks + block_idx;
+  scales[scale_offset] = fp8_scale_bits;
 #endif
 
   } // for block_idx
+}
+
+__device__ __forceinline__ float nvfp4_rms_warp_sum(float value) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset /= 2) {
+    value = __fadd_rn(
+        value, __shfl_down_sync(0xffffffffu, value, offset));
+  }
+  return value;
+}
+
+// 512 physical threads emulate Candle's 1024 logical RMSNorm lanes while
+// retaining Candle's per-lane accumulation and final 32-warp reduction order.
+__global__ __launch_bounds__(NVFP4_QUANT_MAX_THREADS)
+void nvfp4_quantize_rms_norm_bf16_kernel(
+    const nv_bfloat16* __restrict__ input,
+    const nv_bfloat16* __restrict__ weight,
+    uint8_t* __restrict__ output,
+    uint8_t* __restrict__ swizzled_scales,
+    float eps, float SFScaleVal,
+    int M, int K, int K_scale_padded)
+{
+  __shared__ float warp_sums[32];
+
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (row >= M) return;
+
+  const int64_t row_base = static_cast<int64_t>(row) * K;
+  float low_sum = 0.0f;
+  for (int col = tid; col < K; col += 1024) {
+    const float value = __bfloat162float(input[row_base + col]);
+    low_sum = __fmaf_rn(value, value, low_sum);
+  }
+  float high_sum = 0.0f;
+  for (int col = tid + NVFP4_QUANT_MAX_THREADS; col < K; col += 1024) {
+    const float value = __bfloat162float(input[row_base + col]);
+    high_sum = __fmaf_rn(value, value, high_sum);
+  }
+
+  low_sum = nvfp4_rms_warp_sum(low_sum);
+  high_sum = nvfp4_rms_warp_sum(high_sum);
+  if ((tid & 31) == 0) {
+    const int physical_warp = tid / 32;
+    warp_sums[physical_warp] = low_sum;
+    warp_sums[physical_warp + 16] = high_sum;
+  }
+  __syncthreads();
+
+  if (tid < 32) {
+    const float total = nvfp4_rms_warp_sum(warp_sums[tid]);
+    if (tid == 0) warp_sums[0] = total;
+  }
+  __syncthreads();
+
+  const float mean = __fdiv_rn(warp_sums[0], static_cast<float>(K));
+  const float rms_scale = rsqrtf(__fadd_rn(mean, eps));
+  const int num_blocks = K / NVFP4_BLOCK_SIZE;
+  for (int block_idx = tid; block_idx < num_blocks;
+       block_idx += NVFP4_QUANT_MAX_THREADS) {
+    const int k_start = block_idx * NVFP4_BLOCK_SIZE;
+    float vals[NVFP4_BLOCK_SIZE];
+#pragma unroll
+    for (int index = 0; index < NVFP4_BLOCK_SIZE; ++index) {
+      const int col = k_start + index;
+      const float source = __bfloat162float(input[row_base + col]);
+      const float norm_weight = __bfloat162float(weight[col]);
+      const float normalized =
+          __fmul_rn(__fmul_rn(rms_scale, source), norm_weight);
+      vals[index] = __bfloat162float(__float2bfloat16_rn(normalized));
+    }
+
+    float vec_max = 0.0f;
+#pragma unroll
+    for (int index = 0; index < NVFP4_BLOCK_SIZE; ++index) {
+      vec_max = fmaxf(vec_max, fabsf(vals[index]));
+    }
+
+    uint8_t fp8_scale_bits = 0;
+    float sf_value = __fdiv_rn(__fmul_rn(SFScaleVal, vec_max), 6.0f);
+    float output_scale = 0.0f;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    __nv_fp8_e4m3 fp8_scale = __nv_fp8_e4m3(sf_value);
+    fp8_scale_bits = clamp_nvfp4_e4m3_scale(fp8_scale.__x);
+    fp8_scale.__x = fp8_scale_bits;
+    sf_value = static_cast<float>(fp8_scale);
+    output_scale = sf_value != 0.0f
+        ? __fdiv_rn(SFScaleVal, sf_value)
+        : 0.0f;
+
+    float scaled_low[8], scaled_high[8];
+#pragma unroll
+    for (int index = 0; index < 8; ++index) {
+      scaled_low[index] = __fmul_rn(vals[index], output_scale);
+      scaled_high[index] = __fmul_rn(vals[index + 8], output_scale);
+    }
+    const int64_t out_base =
+        static_cast<int64_t>(row) * (K / 2) + k_start / 2;
+    reinterpret_cast<uint32_t*>(output + out_base)[0] =
+        fp32x8_to_e2m1x8(scaled_low);
+    reinterpret_cast<uint32_t*>(output + out_base)[1] =
+        fp32x8_to_e2m1x8(scaled_high);
+#else
+    if (sf_value > 0.0f) {
+      __nv_fp8_e4m3 fp8_scale = __nv_fp8_e4m3(sf_value);
+      fp8_scale_bits = clamp_nvfp4_e4m3_scale(fp8_scale.__x);
+      fp8_scale.__x = fp8_scale_bits;
+      sf_value = static_cast<float>(fp8_scale);
+      output_scale = sf_value != 0.0f
+          ? __fdiv_rn(SFScaleVal, sf_value)
+          : 0.0f;
+    }
+    const int64_t out_base =
+        static_cast<int64_t>(row) * (K / 2) + k_start / 2;
+#pragma unroll
+    for (int index = 0; index < 8; ++index) {
+      const uint8_t low = float_to_fp4_e2m1(
+          __fmul_rn(vals[index * 2], output_scale));
+      const uint8_t high = float_to_fp4_e2m1(
+          __fmul_rn(vals[index * 2 + 1], output_scale));
+      output[out_base + index] = (high << 4) | low;
+    }
+#endif
+    swizzled_scales[nvfp4_swizzled_scale_offset(
+        row, block_idx, K_scale_padded)] = fp8_scale_bits;
+  }
 }
 
 // ============================================================================
@@ -374,25 +538,7 @@ __global__ void nvfp4_swizzle_scales_kernel(
     val = linear_scales[mIdx * cols + kIdx];
   }
 
-  // Compute swizzled destination offset matching TRT-LLM's get_sf_out_offset_128x4
-  int innerKIdx = kIdx % 4;
-  int innerMIdx = (mIdx % 128) / 32;
-  int outerMIdx = mIdx % 32;
-  int kTileIdx = kIdx / 4;
-  int mTileIdx = mIdx / 128;
-
-  int numKTiles = (cols_padded + 3) / 4;
-
-  int64_t kTileStride = 512;  // 32 * 4 * 4
-  int64_t mTileStride = (int64_t)numKTiles * kTileStride;
-
-  int64_t dstOffset = (int64_t)mTileIdx * mTileStride
-                    + (int64_t)kTileIdx * kTileStride
-                    + outerMIdx * 16
-                    + innerMIdx * 4
-                    + innerKIdx;
-
-  swizzled_scales[dstOffset] = val;
+  swizzled_scales[nvfp4_swizzled_scale_offset(mIdx, kIdx, cols_padded)] = val;
 }
 
 // ============================================================================
@@ -461,6 +607,78 @@ void nvfp4_quantize_activation_bf16(
       static_cast<uint8_t*>(swizzled_scales),
       M, num_blocks_k,
       M_padded, K_scale_padded);
+}
+
+int nvfp4_quantize_silu_and_mul_bf16(
+    const void* gate_up,
+    void* output,
+    void* swizzled_scales,
+    float input_scale_inv,
+    int M, int K,
+    int M_padded, int K_scale_padded,
+    int64_t stream)
+{
+  if (gate_up == nullptr || output == nullptr || swizzled_scales == nullptr ||
+      M <= 0 || K <= 0 || K % NVFP4_BLOCK_SIZE != 0 ||
+      M_padded < M || M_padded % 128 != 0 ||
+      K_scale_padded < K / NVFP4_BLOCK_SIZE || K_scale_padded % 4 != 0) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+
+  cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+  size_t scale_bytes = static_cast<size_t>(M_padded) * K_scale_padded;
+  cudaError_t status = cudaMemsetAsync(swizzled_scales, 0, scale_bytes, cuda_stream);
+  if (status != cudaSuccess) {
+    return static_cast<int>(status);
+  }
+
+  int num_blocks_k = K / NVFP4_BLOCK_SIZE;
+  dim3 grid(M);
+  dim3 block(min(num_blocks_k, NVFP4_QUANT_MAX_THREADS));
+  nvfp4_quantize_activation_hw_kernel<nv_bfloat16, true>
+      <<<grid, block, 0, cuda_stream>>>(
+          static_cast<const nv_bfloat16*>(gate_up),
+          static_cast<uint8_t*>(output),
+          static_cast<uint8_t*>(swizzled_scales),
+          input_scale_inv,
+          M, K, M_padded, K_scale_padded);
+  return static_cast<int>(cudaPeekAtLastError());
+}
+
+int nvfp4_quantize_rms_norm_bf16(
+    const void* input,
+    const void* weight,
+    void* output,
+    void* swizzled_scales,
+    float eps,
+    float input_scale_inv,
+    int M, int K,
+    int M_padded, int K_scale_padded,
+    int64_t stream)
+{
+  if (input == nullptr || weight == nullptr || output == nullptr ||
+      swizzled_scales == nullptr || !isfinite(eps) || eps < 0.0f ||
+      !isfinite(input_scale_inv) || input_scale_inv <= 0.0f ||
+      M <= 0 || K <= 0 || K % 128 != 0 || M_padded < M ||
+      M_padded % 128 != 0 || K_scale_padded < K / NVFP4_BLOCK_SIZE ||
+      K_scale_padded % 4 != 0) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+
+  cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+  size_t scale_bytes = static_cast<size_t>(M_padded) * K_scale_padded;
+  cudaError_t status = cudaMemsetAsync(
+      swizzled_scales, 0, scale_bytes, cuda_stream);
+  if (status != cudaSuccess) return static_cast<int>(status);
+
+  nvfp4_quantize_rms_norm_bf16_kernel
+      <<<M, NVFP4_QUANT_MAX_THREADS, 0, cuda_stream>>>(
+      static_cast<const nv_bfloat16*>(input),
+      static_cast<const nv_bfloat16*>(weight),
+      static_cast<uint8_t*>(output),
+      static_cast<uint8_t*>(swizzled_scales),
+      eps, input_scale_inv, M, K, K_scale_padded);
+  return static_cast<int>(cudaPeekAtLastError());
 }
 
 // Swizzle weight scales from linear to CUTLASS 128x4 layout
@@ -859,6 +1077,17 @@ void nvfp4_quantize_activation_f16(
 
 void nvfp4_quantize_activation_bf16(
     const void*, void*, void*, void*, float, int, int, int, int, int64_t) {}
+
+int nvfp4_quantize_silu_and_mul_bf16(
+    const void*, void*, void*, float, int, int, int, int, int64_t) {
+  return 1;
+}
+
+int nvfp4_quantize_rms_norm_bf16(
+    const void*, const void*, void*, void*, float, float,
+    int, int, int, int, int64_t) {
+  return 1;
+}
 
 void nvfp4_quantize_activation_grouped_f16(
     const void*, void*, void*, const float*, const int32_t*, const int32_t*, int, int, int, int, int64_t) {}
