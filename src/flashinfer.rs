@@ -2,9 +2,10 @@ use crate::cuda_utils;
 use crate::kernels;
 use candle_core as candle;
 use candle_core::backend::BackendStorage;
-use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+use candle_core::cuda_backend::cudarc::driver::{DevicePtr, DeviceSlice};
+use candle_core::cuda_backend::CudaStorageSlice;
 use candle_core::cuda_backend::WrapErr;
-use candle_core::{CudaStorage, DType, Layout, Result, Storage, Tensor};
+use candle_core::{CudaStorage, DType, Device, Layout, Result, Storage, Tensor};
 use std::sync::Arc;
 
 // Re-export workspace functions and constants for backward compatibility with external callers
@@ -13,6 +14,97 @@ pub(crate) use crate::workspace::{
     get_gemm_scratch_workspace, get_or_init_workspace, get_plan_workspace, GEMM_SCRATCH_FLOAT_SIZE,
     WORKSPACE_FLOAT_SIZE,
 };
+
+/// Caller-owned output storage for sequential FlashInfer decode operations.
+///
+/// The backing allocation is intentionally uninitialized and cannot be
+/// obtained through this owner until a decode operation reports a successful
+/// launch. Callers must enqueue every consumer before the next decode attempt
+/// and must not retain tensor clones or views across attempts; Candle cannot
+/// revoke handles that were cloned from a previously valid output.
+pub struct FlashInferDecodeOutput {
+    tensor: Tensor,
+    valid: bool,
+}
+
+impl FlashInferDecodeOutput {
+    /// Allocates an uninitialized decode output on an exact CUDA device.
+    pub fn new(
+        device: &Device,
+        dtype: DType,
+        batch_size: usize,
+        num_qo_heads: usize,
+        head_dim: usize,
+    ) -> Result<Self> {
+        device.as_cuda_device()?;
+        if !matches!(dtype, DType::F16 | DType::BF16) {
+            candle::bail!("flashinfer decode output requires F16 or BF16, got {dtype:?}")
+        }
+        let tensor =
+            unsafe { Tensor::empty_((batch_size, num_qo_heads, head_dim), dtype, device)? };
+        Ok(Self {
+            tensor,
+            valid: false,
+        })
+    }
+
+    /// Returns the initialized output from the most recent successful decode.
+    ///
+    /// The reference, and every clone or view derived from it, is ephemeral and
+    /// must not be used after the next decode attempt starts.
+    pub fn as_tensor(&self) -> Result<&Tensor> {
+        if !self.valid {
+            candle::bail!("flashinfer decode output is not initialized")
+        }
+        Ok(&self.tensor)
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.valid = false;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CudaByteRange {
+    start: usize,
+    end: usize,
+}
+
+impl CudaByteRange {
+    fn overlaps(self, other: Self) -> bool {
+        self.start < other.end && other.start < self.end
+    }
+}
+
+fn cuda_storage_byte_range(storage: &CudaStorage) -> CudaByteRange {
+    macro_rules! range {
+        ($slice:expr) => {{
+            let slice = $slice;
+            let start = *slice.device_ptr() as usize;
+            CudaByteRange {
+                start,
+                end: start.saturating_add(slice.num_bytes()),
+            }
+        }};
+    }
+    match &storage.slice {
+        CudaStorageSlice::U8(slice) => range!(slice),
+        CudaStorageSlice::U32(slice) => range!(slice),
+        CudaStorageSlice::I64(slice) => range!(slice),
+        CudaStorageSlice::BF16(slice) => range!(slice),
+        CudaStorageSlice::F16(slice) => range!(slice),
+        CudaStorageSlice::F32(slice) => range!(slice),
+        CudaStorageSlice::F64(slice) => range!(slice),
+    }
+}
+
+fn tensor_cuda_byte_range(tensor: &Tensor) -> Result<CudaByteRange> {
+    let (storage, _) = tensor.storage_and_layout();
+    match &*storage {
+        Storage::Cuda(storage) => Ok(cuda_storage_byte_range(storage)),
+        _ => candle::bail!("flashinfer decode input must be on CUDA"),
+    }
+}
 
 fn is_supported_flashinfer_gqa_group_size(group_size: usize) -> bool {
     matches!(group_size, 1 | 2 | 3 | 4 | 5 | 6 | 8 | 16 | 32 | 64)
@@ -423,6 +515,36 @@ impl candle::CustomOp1 for FlashInferDecodeWithPlan {
     }
 }
 
+impl candle::InplaceOp2 for FlashInferDecodeWithPlan {
+    fn name(&self) -> &'static str {
+        "flashinfer-decode-with-plan-into"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &mut candle::CpuStorage,
+        _: &Layout,
+        _: &candle::CpuStorage,
+        _: &Layout,
+    ) -> Result<()> {
+        candle::bail!("no cpu support")
+    }
+
+    fn cuda_fwd(
+        &self,
+        output: &mut CudaStorage,
+        output_l: &Layout,
+        q: &CudaStorage,
+        q_l: &Layout,
+    ) -> Result<()> {
+        match q.dtype() {
+            DType::F16 => self.cuda_fwd_into_impl::<half::f16>(output, output_l, q, q_l),
+            DType::BF16 => self.cuda_fwd_into_impl::<half::bf16>(output, output_l, q, q_l),
+            _ => candle::bail!("caller-owned flashinfer decode output requires F16 or BF16"),
+        }
+    }
+}
+
 impl FlashInferDecodeWithPlan {
     fn cuda_fwd_impl<
         T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
@@ -431,6 +553,23 @@ impl FlashInferDecodeWithPlan {
         q: &CudaStorage,
         q_l: &Layout,
     ) -> Result<(CudaStorage, candle::Shape)> {
+        let dev = q.device();
+        let out = unsafe { dev.alloc::<T>(q_l.shape().elem_count()) }.w()?;
+        let mut output = CudaStorage::wrap_cuda_slice(out, dev.clone());
+        let output_l = Layout::contiguous(q_l.shape().clone());
+        self.cuda_fwd_into_impl::<T>(&mut output, &output_l, q, q_l)?;
+        Ok((output, q_l.shape().clone()))
+    }
+
+    fn cuda_fwd_into_impl<
+        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
+    >(
+        &self,
+        output: &mut CudaStorage,
+        output_l: &Layout,
+        q: &CudaStorage,
+        q_l: &Layout,
+    ) -> Result<()> {
         let dev = q.device();
         let (batch_size, _, _) = q_l.shape().dims3()?;
         if self.num_kv_heads == 0 || self.num_qo_heads % self.num_kv_heads != 0 {
@@ -510,8 +649,8 @@ impl FlashInferDecodeWithPlan {
 
         let q_ptr = get_cuda_ptr_storage(q, q_l, q.dtype())?;
 
-        let out = unsafe { dev.alloc::<T>(q_l.shape().elem_count()) }.w()?;
-        let out_ptr = *out.device_ptr() as *mut std::ffi::c_void;
+        let out_ptr =
+            get_cuda_ptr_storage(output, output_l, output.dtype())? as *mut std::ffi::c_void;
         let (ws_float_ptr, ws_float_size, ws_int_ptr, ws_int_size, _, _) =
             get_plan_workspace(dev, self.enable_cuda_graph)?;
 
@@ -532,7 +671,7 @@ impl FlashInferDecodeWithPlan {
             (std::ptr::null(), std::ptr::null())
         };
 
-        unsafe {
+        let status = unsafe {
             if use_sm90_fp8 {
                 kernels::ffi::flashinfer_decode_run_wrapper_fp8(
                     out_ptr,
@@ -558,7 +697,7 @@ impl FlashInferDecodeWithPlan {
                     data_type,
                     out_data_type,
                     *dev.cu_stream() as i64,
-                );
+                )
             } else {
                 kernels::ffi::flashinfer_decode_run_wrapper(
                     out_ptr,
@@ -586,12 +725,13 @@ impl FlashInferDecodeWithPlan {
                     data_type,
                     out_data_type,
                     *dev.cu_stream() as i64,
-                );
+                )
             }
+        };
+        if status != 0 {
+            candle::bail!("flashinfer decode launch failed with CUDA error {status}")
         }
-
-        let out = CudaStorage::wrap_cuda_slice(out, dev.clone());
-        Ok((out, q_l.shape().clone()))
+        Ok(())
     }
 }
 
@@ -675,6 +815,253 @@ pub fn decode_with_plan_shared(
         logits_soft_cap: logits_soft_cap.unwrap_or(0.0f32),
     };
     q.apply_op1(op)
+}
+
+/// Runs decode into reusable caller-owned storage.
+///
+/// The owner rejects new observations before validation begins and permits
+/// them only after the native adapter reports a successful launch. Previously
+/// cloned tensor handles cannot be revoked and must not cross this call.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_with_plan_into(
+    output: &mut FlashInferDecodeOutput,
+    q: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    k_scale: Option<&Tensor>,
+    v_scale: Option<&Tensor>,
+    indices: &Tensor,
+    indptr: &Tensor,
+    last_len: &Tensor,
+    block_size: usize,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sm_scale: f32,
+    plan_info: Arc<Vec<i64>>,
+    enable_cuda_graph: bool,
+    window_left: Option<i32>,
+    logits_soft_cap: Option<f32>,
+) -> Result<()> {
+    output.valid = false;
+    if enable_cuda_graph {
+        candle::bail!("caller-owned flashinfer decode output does not support CUDA Graph")
+    }
+    validate_decode_output(
+        &output.tensor,
+        q,
+        key_cache,
+        value_cache,
+        k_scale,
+        v_scale,
+        indices,
+        indptr,
+        last_len,
+        num_qo_heads,
+        head_dim,
+    )?;
+    let op = FlashInferDecodeWithPlan {
+        key_cache: key_cache.clone(),
+        value_cache: value_cache.clone(),
+        k_scale: k_scale.cloned(),
+        v_scale: v_scale.cloned(),
+        indices: indices.clone(),
+        indptr: indptr.clone(),
+        last_len: last_len.clone(),
+        block_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        sm_scale,
+        plan_info,
+        enable_cuda_graph: false,
+        window_left: window_left.unwrap_or(-1),
+        logits_soft_cap: logits_soft_cap.unwrap_or(0.0f32),
+    };
+    output.tensor.inplace_op2(q, &op)?;
+    output.valid = true;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_decode_output(
+    output: &Tensor,
+    q: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    k_scale: Option<&Tensor>,
+    v_scale: Option<&Tensor>,
+    indices: &Tensor,
+    indptr: &Tensor,
+    last_len: &Tensor,
+    num_qo_heads: usize,
+    head_dim: usize,
+) -> Result<()> {
+    let (batch_size, q_heads, q_head_dim) = q.dims3()?;
+    let expected = [batch_size, num_qo_heads, head_dim];
+    if [batch_size, q_heads, q_head_dim] != expected || output.dims() != expected {
+        candle::bail!(
+            "flashinfer decode output shape mismatch: expected {expected:?}, q={:?}, output={:?}",
+            q.dims(),
+            output.dims()
+        )
+    }
+    if output.dtype() != q.dtype() {
+        candle::bail!(
+            "flashinfer decode output dtype mismatch: q={:?}, output={:?}",
+            q.dtype(),
+            output.dtype()
+        )
+    }
+    if !output.is_contiguous() || output.layout().start_offset() != 0 {
+        candle::bail!("flashinfer decode output must be contiguous with zero storage offset")
+    }
+
+    let inputs = [
+        Some(("query", q)),
+        Some(("key cache", key_cache)),
+        Some(("value cache", value_cache)),
+        k_scale.map(|tensor| ("key scale", tensor)),
+        v_scale.map(|tensor| ("value scale", tensor)),
+        Some(("indices", indices)),
+        Some(("indptr", indptr)),
+        Some(("last length", last_len)),
+    ];
+    for (name, input) in inputs.iter().flatten().copied() {
+        if !output.device().same_device(input.device()) {
+            candle::bail!("flashinfer decode {name} must use the exact output CUDA device")
+        }
+    }
+    let output_range = tensor_cuda_byte_range(output)?;
+    for (name, input) in inputs.into_iter().flatten() {
+        let input_range = tensor_cuda_byte_range(input)?;
+        if output_range.overlaps(input_range) {
+            candle::bail!("flashinfer decode output storage overlaps {name}")
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod decode_output_validation_tests {
+    use super::*;
+
+    fn validation_inputs(
+        device: &Device,
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)> {
+        Ok((
+            Tensor::zeros((1, 1, 128), DType::BF16, device)?,
+            Tensor::zeros((1, 32, 1, 128), DType::BF16, device)?,
+            Tensor::zeros((1, 32, 1, 128), DType::BF16, device)?,
+            Tensor::zeros(1, DType::U32, device)?,
+            Tensor::zeros(2, DType::U32, device)?,
+            Tensor::zeros(1, DType::U32, device)?,
+        ))
+    }
+
+    fn validate_fixture(output: &Tensor, q: &Tensor, device: &Device) -> Result<()> {
+        let (_, key_cache, value_cache, indices, indptr, last_len) = validation_inputs(device)?;
+        validate_decode_output(
+            output,
+            q,
+            &key_cache,
+            &value_cache,
+            None,
+            None,
+            &indices,
+            &indptr,
+            &last_len,
+            1,
+            128,
+        )
+    }
+
+    #[test]
+    fn decode_output_rejects_wrong_shape_and_dtype() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let (q, _, _, _, _, _) = validation_inputs(&device)?;
+        let wrong_shape = Tensor::zeros((1, 1, 64), DType::BF16, &device)?;
+        let wrong_dtype = Tensor::zeros((1, 1, 128), DType::F16, &device)?;
+
+        assert!(validate_fixture(&wrong_shape, &q, &device)
+            .expect_err("wrong output shape must fail")
+            .to_string()
+            .contains("shape mismatch"));
+        assert!(validate_fixture(&wrong_dtype, &q, &device)
+            .expect_err("wrong output dtype must fail")
+            .to_string()
+            .contains("dtype mismatch"));
+        Ok(())
+    }
+
+    #[test]
+    fn decode_output_rejects_noncontiguous_and_nonzero_offset_layouts() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let q = Tensor::zeros((1, 2, 128), DType::BF16, &device)?;
+        let noncontiguous = Tensor::zeros((1, 128, 2), DType::BF16, &device)?.transpose(1, 2)?;
+        let base = Tensor::zeros((2, 2, 128), DType::BF16, &device)?;
+        let nonzero_offset = base.narrow(0, 1, 1)?;
+        let (_, key_cache, value_cache, indices, indptr, last_len) = validation_inputs(&device)?;
+        let validate = |output: &Tensor| {
+            validate_decode_output(
+                output,
+                &q,
+                &key_cache,
+                &value_cache,
+                None,
+                None,
+                &indices,
+                &indptr,
+                &last_len,
+                2,
+                128,
+            )
+        };
+
+        assert!(validate(&noncontiguous)
+            .expect_err("noncontiguous output must fail")
+            .to_string()
+            .contains("contiguous"));
+        assert!(validate(&nonzero_offset)
+            .expect_err("nonzero output offset must fail")
+            .to_string()
+            .contains("zero storage offset"));
+        Ok(())
+    }
+
+    #[test]
+    fn decode_output_rejects_wrong_exact_device() -> Result<()> {
+        let cuda = Device::new_cuda(0)?;
+        let (q, _, _, _, _, _) = validation_inputs(&cuda)?;
+        let other_cuda_handle = Device::new_cuda(0)?;
+        assert!(!cuda.same_device(&other_cuda_handle));
+        let output = Tensor::zeros((1, 1, 128), DType::BF16, &other_cuda_handle)?;
+
+        let error = validate_fixture(&output, &q, &cuda)
+            .expect_err("a distinct CUDA handle must not match the query device");
+        assert!(error.to_string().contains("exact output CUDA device"));
+        Ok(())
+    }
+
+    #[test]
+    fn decode_output_rejects_full_and_partial_aliases_with_distinct_tensor_ids() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let full = Tensor::zeros((1, 1, 128), DType::BF16, &device)?;
+        let full_alias = full.reshape((1, 1, 128))?;
+        assert_ne!(full.id(), full_alias.id());
+        let full_error = validate_fixture(&full, &full_alias, &device)
+            .expect_err("full backing allocation alias must fail");
+        assert!(full_error.to_string().contains("overlaps query"));
+
+        let base = Tensor::zeros(129, DType::BF16, &device)?;
+        let output = base.narrow(0, 0, 128)?.reshape((1, 1, 128))?;
+        let partial_alias = base.narrow(0, 1, 128)?.reshape((1, 1, 128))?;
+        assert_ne!(output.id(), partial_alias.id());
+        let partial_error = validate_fixture(&output, &partial_alias, &device)
+            .expect_err("partially overlapping views must fail");
+        assert!(partial_error.to_string().contains("overlaps query"));
+        Ok(())
+    }
 }
 
 pub fn decode_plan(

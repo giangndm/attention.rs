@@ -417,7 +417,7 @@ void flashinfer_decode_plan_wrapper_fp8(
 #endif
 }
 
-void flashinfer_decode_run_wrapper_fp8(
+int flashinfer_decode_run_wrapper_fp8(
     void* out_ptr,
     void* q_ptr,
     void* k_data, void* v_data,
@@ -443,10 +443,11 @@ void flashinfer_decode_run_wrapper_fp8(
 ) {
 #if defined(USE_FLASHINFER) && defined(FLASHINFER_ENABLE_FP8_E4M3)
     if (data_type != 2 || !plan_info_vec) {
-        return;
+        return static_cast<int>(cudaErrorInvalidValue);
     }
-    if (!k_scale_ptr || !v_scale_ptr) {
-        return;
+    if (!out_ptr || !q_ptr || !k_data || !v_data || !indices || !indptr || !last_len ||
+        !k_scale_ptr || !v_scale_ptr || !workspace_float || !workspace_int) {
+        return static_cast<int>(cudaErrorInvalidValue);
     }
     using IdType = int32_t;
     std::vector<int64_t> vec(plan_info_vec, plan_info_vec + 9);
@@ -459,8 +460,17 @@ void flashinfer_decode_run_wrapper_fp8(
     float* q_scale_arr = nullptr;
     constexpr double q_scale_scalar = 1.0;
     int64_t numel = static_cast<int64_t>(batch_size) * num_qo_heads * head_dim;
-    cudaMallocAsync(&q_fp8_ptr, static_cast<size_t>(numel) * sizeof(uint8_t), stream);
-    cudaMallocAsync(&q_scale_arr, static_cast<size_t>(num_qo_heads) * sizeof(float), stream);
+    cudaError_t status = cudaMallocAsync(
+        &q_fp8_ptr, static_cast<size_t>(numel) * sizeof(uint8_t), stream);
+    if (status != cudaSuccess) {
+        return static_cast<int>(status);
+    }
+    status = cudaMallocAsync(
+        &q_scale_arr, static_cast<size_t>(num_qo_heads) * sizeof(float), stream);
+    if (status != cudaSuccess) {
+        cudaFreeAsync(q_fp8_ptr, stream);
+        return static_cast<int>(status);
+    }
 
     bool is_input_f16 = (out_data_type == 0);
     flashinfer_fp8_quantize_q_per_head(
@@ -499,12 +509,22 @@ void flashinfer_decode_run_wrapper_fp8(
         launch_fp8_prefill(cutlass::half_t{});
     }
 
+    status = cudaPeekAtLastError();
     if (q_fp8_ptr) {
-        cudaFreeAsync(q_fp8_ptr, stream);
+        const cudaError_t free_status = cudaFreeAsync(q_fp8_ptr, stream);
+        if (status == cudaSuccess) {
+            status = free_status;
+        }
     }
     if (q_scale_arr) {
-        cudaFreeAsync(q_scale_arr, stream);
+        const cudaError_t free_status = cudaFreeAsync(q_scale_arr, stream);
+        if (status == cudaSuccess) {
+            status = free_status;
+        }
     }
+    return static_cast<int>(status);
+#else
+    return static_cast<int>(cudaErrorNotSupported);
 #endif
 }
 

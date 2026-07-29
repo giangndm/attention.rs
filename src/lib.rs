@@ -118,6 +118,11 @@ fn metal_flash_cast_contiguous(t: &Tensor, dtype: DType) -> Result<Tensor> {
 #[cfg(feature = "flashinfer")]
 pub mod flashinfer;
 
+#[cfg(feature = "flashinfer")]
+type FlashInferDecodeOutputArg<'a> = Option<&'a mut flashinfer::FlashInferDecodeOutput>;
+#[cfg(not(feature = "flashinfer"))]
+type FlashInferDecodeOutputArg<'a> = Option<&'a mut ()>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurboquantMode {
     Turbo8,
@@ -755,6 +760,80 @@ impl PagedAttention {
         input_metadata: &InputMetadata,
         softcapping: Option<f64>,
     ) -> Result<Tensor> {
+        self.forward_impl(
+            query,
+            key,
+            value,
+            attention_mask,
+            key_cache,
+            value_cache,
+            input_metadata,
+            softcapping,
+            None,
+        )
+    }
+
+    /// Runs an eligible FlashInfer decode into caller-owned output storage.
+    #[cfg(feature = "flashinfer")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_flashinfer_decode_into(
+        &self,
+        output: &mut flashinfer::FlashInferDecodeOutput,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        attention_mask: Option<&Vec<Tensor>>,
+        key_cache: Option<Tensor>,
+        value_cache: Option<Tensor>,
+        input_metadata: &InputMetadata,
+        softcapping: Option<f64>,
+    ) -> Result<()> {
+        output.invalidate();
+        if input_metadata
+            .flashinfer_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.use_cuda_graph)
+        {
+            candle_core::bail!("caller-owned flashinfer decode output does not support CUDA Graph")
+        }
+        self.forward_impl(
+            query,
+            key,
+            value,
+            attention_mask,
+            key_cache,
+            value_cache,
+            input_metadata,
+            softcapping,
+            Some(output),
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(unused_variables)]
+    #[allow(unused_mut)]
+    #[allow(unreachable_code)]
+    fn forward_impl(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        attention_mask: Option<&Vec<Tensor>>,
+        key_cache: Option<Tensor>,
+        value_cache: Option<Tensor>,
+        input_metadata: &InputMetadata,
+        softcapping: Option<f64>,
+        mut decode_output: FlashInferDecodeOutputArg<'_>,
+    ) -> Result<Tensor> {
+        #[cfg(feature = "flashinfer")]
+        if decode_output.is_some()
+            && (input_metadata.is_prefill || input_metadata.flashinfer_metadata.is_none())
+        {
+            candle_core::bail!(
+                "caller-owned flashinfer decode output requires eligible decode metadata"
+            )
+        }
         // head_dim > 256: FlashAttn/FlashInfer don't support it.
         // TurboQuant: only native flash path supports turbo KV cache.
         // Both cases force use of native flash path below.
@@ -878,6 +957,29 @@ impl PagedAttention {
                                 "flashinfer decode requires decode_plan_info (plan+run path)",
                             )
                         })?;
+                        if let Some(output) = decode_output.as_mut() {
+                            crate::flashinfer::decode_with_plan_into(
+                                output,
+                                &query,
+                                key_cache.as_ref().unwrap(),
+                                value_cache.as_ref().unwrap(),
+                                self.k_scale.as_ref(),
+                                self.v_scale.as_ref(),
+                                &fm.indices,
+                                &fm.indptr,
+                                &fm.last_len,
+                                block_size,
+                                attention_heads,
+                                key_value_heads,
+                                head_size,
+                                self.scale as f32,
+                                plan_info.clone(),
+                                fm.use_cuda_graph,
+                                Some(flashinfer_run_window_left(fm.window_left)),
+                                Some(softcapping.unwrap_or(0.0f64) as f32),
+                            )?;
+                            return Ok(output.as_tensor()?.clone());
+                        }
                         return crate::flashinfer::decode_with_plan_shared(
                             &query,
                             key_cache.as_ref().unwrap(),
@@ -910,6 +1012,11 @@ impl PagedAttention {
                 }
             }
         } // end if !force_native_flash (flashinfer)
+
+        #[cfg(feature = "flashinfer")]
+        if decode_output.is_some() {
+            candle_core::bail!("caller-owned flashinfer decode output cannot use a fallback path")
+        }
 
         #[cfg(feature = "flashattn")]
         if !skip_flashattn {
