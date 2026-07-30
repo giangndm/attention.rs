@@ -1,5 +1,8 @@
 #include "flashinfer_common.cuh"
 
+#include <cmath>
+#include <exception>
+
 #if defined(FLASHINFER_ENABLE_FP8_E4M3)
 extern "C" {
 void flashinfer_prefill_wrapper_fp8(
@@ -77,7 +80,7 @@ __global__ void scale_output_inplace_kernel(T* out, int64_t numel, float scale) 
 
 extern "C" {
 
-void flashinfer_prefill_ragged_wrapper(
+int32_t flashinfer_prefill_ragged_wrapper_checked(
     void* out_ptr,
     void* q_ptr,
     int32_t* q_cu_seqlens,
@@ -93,39 +96,47 @@ void flashinfer_prefill_ragged_wrapper(
     int32_t num_kv_heads,
     int32_t head_dim,
     float sm_scale,
-    const float* k_scale_ptr,
-    const float* v_scale_ptr,
     void* workspace_float,
     size_t workspace_float_size,
     void* workspace_int,
     size_t workspace_int_size,
     void* page_locked_int_buffer,
     size_t page_locked_int_size,
-    bool enable_cuda_graph,
-    int32_t data_type,
+    int32_t mask_mode,
     int32_t out_data_type,
     cudaStream_t stream
 ) {
+try {
 #ifdef USE_FLASHINFER
-    if (data_type == 2) {
-#if defined(FLASHINFER_ENABLE_FP8_E4M3)
-        flashinfer_prefill_ragged_wrapper_fp8(
-            out_ptr, q_ptr, q_cu_seqlens, kv_cu_seqlens, q_cu_seqlens_host, kv_cu_seqlens_host,
-            total_num_rows, total_kv_rows, k_ptr, v_ptr, batch_size, num_qo_heads, num_kv_heads,
-            head_dim, sm_scale, k_scale_ptr, v_scale_ptr, workspace_float, workspace_float_size,
-            workspace_int, workspace_int_size, page_locked_int_buffer, page_locked_int_size,
-            enable_cuda_graph, data_type, out_data_type, stream
-        );
-#endif
-        return;
+    if (mask_mode != 0 && mask_mode != 1) {
+        return 4;
     }
     if (page_locked_int_buffer == nullptr || page_locked_int_size < workspace_int_size) {
-        return;
+        return 3;
     }
     if (q_cu_seqlens_host == nullptr || kv_cu_seqlens_host == nullptr ||
-        q_cu_seqlens == nullptr || kv_cu_seqlens == nullptr) {
-        return;
+        q_cu_seqlens == nullptr || kv_cu_seqlens == nullptr || out_ptr == nullptr ||
+        q_ptr == nullptr || k_ptr == nullptr || v_ptr == nullptr ||
+        workspace_float == nullptr || workspace_int == nullptr || batch_size <= 0 ||
+        total_num_rows <= 0 || total_kv_rows <= 0 || num_qo_heads <= 0 ||
+        num_kv_heads <= 0 || num_qo_heads % num_kv_heads != 0 || head_dim <= 0 ||
+        !std::isfinite(sm_scale) || sm_scale <= 0.0f) {
+        return 2;
     }
+    if (out_data_type != 0 && out_data_type != 1) {
+        return 5;
+    }
+    if (head_dim != 64 && head_dim != 128 && head_dim != 256) {
+        return 6;
+    }
+    // Keep native dispatch aligned with FlashInfer's instantiated GQA groups.
+    const int32_t group_size = num_qo_heads / num_kv_heads;
+    if (group_size != 1 && group_size != 2 && group_size != 3 &&
+        group_size != 4 && group_size != 8 && group_size != 16 &&
+        group_size != 32 && group_size != 64) {
+        return 2;
+    }
+    cudaGetLastError();
     const float rope_scale = 1.0f;
     const float rope_theta = 10000.0f;
 #if defined(SM_90_PASS)
@@ -134,18 +145,23 @@ void flashinfer_prefill_ragged_wrapper(
         kv_len_host[i] = kv_cu_seqlens_host[i + 1] - kv_cu_seqlens_host[i];
     }
     PrefillPlanSM90Info plan_info;
-    PrefillSM90Plan<int32_t>(
+    cudaError_t plan_status = PrefillSM90Plan<int32_t>(
         workspace_float, workspace_float_size,
         workspace_int, page_locked_int_buffer, workspace_int_size,
         plan_info,
         q_cu_seqlens_host, kv_cu_seqlens_host, kv_len_host.data(),
         total_num_rows, batch_size,
         num_qo_heads, num_kv_heads, head_dim, head_dim, 1,
-        true, enable_cuda_graph,
+        mask_mode == 1, false,
         (out_data_type == 1 ? sizeof(nv_bfloat16) : sizeof(half)),
         stream
     );
+    if (plan_status != cudaSuccess) {
+        return 1000 + static_cast<int32_t>(plan_status);
+    }
     using IdType = int32_t;
+    cudaError_t dispatch_status = cudaSuccess;
+    bool dispatch_attempted = false;
     auto run_ragged_sm90 = [&](auto dtype_val) {
         using DTypeKV = decltype(dtype_val);
         using DTypeQ = DTypeKV;
@@ -157,38 +173,59 @@ void flashinfer_prefill_ragged_wrapper(
             workspace_int, plan_info);
         using AttentionType = DefaultAttentionAlias<false, false, false, false>;
         DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
+            dispatch_attempted = true;
             if (plan_info.same_schedule_for_all_heads) {
-                BatchPrefillWithRaggedKVCacheDispatched<
-                    HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
-                    params, false, stream);
+                if (mask_mode == 1) {
+                    dispatch_status = BatchPrefillWithRaggedKVCacheDispatched<
+                        HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(params, false, stream);
+                } else {
+                    dispatch_status = BatchPrefillWithRaggedKVCacheDispatched<
+                        HEAD_DIM, HEAD_DIM, MaskMode::kNone, false, true, AttentionType>(params, false, stream);
+                }
             } else {
-                BatchPrefillWithRaggedKVCacheDispatched<
-                    HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
-                    params, false, stream);
+                if (mask_mode == 1) {
+                    dispatch_status = BatchPrefillWithRaggedKVCacheDispatched<
+                        HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(params, false, stream);
+                } else {
+                    dispatch_status = BatchPrefillWithRaggedKVCacheDispatched<
+                        HEAD_DIM, HEAD_DIM, MaskMode::kNone, false, false, AttentionType>(params, false, stream);
+                }
             }
         });
     };
-    if (data_type == 1) {
+    if (out_data_type == 1) {
         run_ragged_sm90(cutlass::bfloat16_t{});
     } else {
         run_ragged_sm90(cutlass::half_t{});
     }
+    if (dispatch_status != cudaSuccess) {
+        return 1000 + static_cast<int32_t>(dispatch_status);
+    }
+    if (!dispatch_attempted) {
+        return 9;
+    }
 #else
+    cudaError_t generic_plan_status = cudaSuccess;
+    cudaError_t dispatch_status = cudaSuccess;
+    bool dispatch_attempted = false;
     auto run_ragged = [&](auto dtype_val) {
         using DTypeKV = decltype(dtype_val);
         using DTypeQ = DTypeKV;
         using DTypeOut = DTypeKV;
         using IdType = int32_t;
         PrefillPlanInfo plan_info;
-        PrefillPlan<int32_t>(
+        generic_plan_status = PrefillPlan<int32_t>(
             workspace_float, workspace_float_size,
             workspace_int, page_locked_int_buffer, workspace_int_size,
             plan_info,
             q_cu_seqlens_host, kv_cu_seqlens_host, total_num_rows,
             batch_size, num_qo_heads, num_kv_heads, head_dim, head_dim, 1,
-            enable_cuda_graph, sizeof(DTypeOut),
+            false, sizeof(DTypeOut),
             -1, 0, false, 0, stream
         );
+        if (generic_plan_status != cudaSuccess) {
+            return;
+        }
         using ParamsType = BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
         ParamsType params(
             (DTypeQ*)q_ptr, (DTypeKV*)k_ptr, (DTypeKV*)v_ptr, nullptr,
@@ -228,22 +265,84 @@ void flashinfer_prefill_ragged_wrapper(
         using AttentionType = DefaultAttentionAlias<false, false, false, false>;
         DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
             DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
-                BatchPrefillWithRaggedKVCacheDispatched<
-                    CTA_TILE_Q, HEAD_DIM, HEAD_DIM,
-                    PosEncodingMode::kNone, false, MaskMode::kCausal,
-                    AttentionType, ParamsType>(
-                    params, tmp_v, tmp_s, false, stream
-                );
+                dispatch_attempted = true;
+                if (mask_mode == 1) {
+                    dispatch_status = BatchPrefillWithRaggedKVCacheDispatched<
+                        CTA_TILE_Q, HEAD_DIM, HEAD_DIM,
+                        PosEncodingMode::kNone, false, MaskMode::kCausal,
+                        AttentionType, ParamsType>(params, tmp_v, tmp_s, false, stream);
+                } else {
+                    dispatch_status = BatchPrefillWithRaggedKVCacheDispatched<
+                        CTA_TILE_Q, HEAD_DIM, HEAD_DIM,
+                        PosEncodingMode::kNone, false, MaskMode::kNone,
+                        AttentionType, ParamsType>(params, tmp_v, tmp_s, false, stream);
+                }
             });
         });
     };
-    if (data_type == 1) {
+    if (out_data_type == 1) {
         run_ragged(nv_bfloat16{});
     } else {
         run_ragged(half{});
     }
+    if (generic_plan_status != cudaSuccess) {
+        return 1000 + static_cast<int32_t>(generic_plan_status);
+    }
+    if (dispatch_status != cudaSuccess) {
+        return 1000 + static_cast<int32_t>(dispatch_status);
+    }
+    if (!dispatch_attempted) {
+        return 9;
+    }
 #endif
+#else
+    return 1;
 #endif
+    cudaError_t launch_status = cudaGetLastError();
+    return launch_status == cudaSuccess ? 0 : 1000 + static_cast<int32_t>(launch_status);
+} catch (const std::exception&) {
+    return 7;
+} catch (...) {
+    return 8;
+}
+}
+
+void flashinfer_prefill_ragged_wrapper(
+    void* out_ptr, void* q_ptr,
+    int32_t* q_cu_seqlens, int32_t* kv_cu_seqlens,
+    int32_t* q_cu_seqlens_host, int32_t* kv_cu_seqlens_host,
+    int32_t total_num_rows, int32_t total_kv_rows,
+    void* k_ptr, void* v_ptr, int32_t batch_size,
+    int32_t num_qo_heads, int32_t num_kv_heads, int32_t head_dim,
+    float sm_scale, const float* k_scale_ptr, const float* v_scale_ptr,
+    void* workspace_float, size_t workspace_float_size,
+    void* workspace_int, size_t workspace_int_size,
+    void* page_locked_int_buffer, size_t page_locked_int_size,
+    bool enable_cuda_graph, int32_t data_type, int32_t out_data_type,
+    cudaStream_t stream
+) {
+    if (data_type == 2) {
+#if defined(FLASHINFER_ENABLE_FP8_E4M3)
+        flashinfer_prefill_ragged_wrapper_fp8(
+            out_ptr, q_ptr, q_cu_seqlens, kv_cu_seqlens,
+            q_cu_seqlens_host, kv_cu_seqlens_host,
+            total_num_rows, total_kv_rows, k_ptr, v_ptr, batch_size,
+            num_qo_heads, num_kv_heads, head_dim, sm_scale,
+            k_scale_ptr, v_scale_ptr, workspace_float, workspace_float_size,
+            workspace_int, workspace_int_size, page_locked_int_buffer,
+            page_locked_int_size, enable_cuda_graph, data_type,
+            out_data_type, stream);
+#endif
+        return;
+    }
+    (void)flashinfer_prefill_ragged_wrapper_checked(
+        out_ptr, q_ptr, q_cu_seqlens, kv_cu_seqlens,
+        q_cu_seqlens_host, kv_cu_seqlens_host,
+        total_num_rows, total_kv_rows, k_ptr, v_ptr, batch_size,
+        num_qo_heads, num_kv_heads, head_dim, sm_scale,
+        workspace_float, workspace_float_size, workspace_int,
+        workspace_int_size, page_locked_int_buffer, page_locked_int_size,
+        1, out_data_type, stream);
 }
 
 // ============================================================================

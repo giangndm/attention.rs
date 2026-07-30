@@ -51,6 +51,13 @@ pub mod metal_flash;
 
 #[cfg(feature = "flashinfer")]
 pub mod flashinfer;
+#[cfg(feature = "ragged-prefill")]
+pub mod ragged_prefill;
+
+#[cfg(all(feature = "ragged-prefill", not(feature = "flashinfer")))]
+pub mod flashinfer {
+    pub use crate::ragged_prefill::{CheckedRaggedLengths, RaggedMask, prefill_ragged_with_mask};
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurboquantMode {

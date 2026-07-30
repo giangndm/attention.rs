@@ -1465,6 +1465,34 @@ extern "C" {
         stream: i64,
     );
 
+    #[cfg(any(feature = "flashinfer", feature = "ragged-prefill"))]
+    pub fn flashinfer_prefill_ragged_wrapper_checked(
+        out_ptr: *mut c_void,
+        q_ptr: *const c_void,
+        q_cu_seqlens: *const i32,
+        kv_cu_seqlens: *const i32,
+        q_cu_seqlens_host: *const i32,
+        kv_cu_seqlens_host: *const i32,
+        total_num_rows: i32,
+        total_kv_rows: i32,
+        k_ptr: *const c_void,
+        v_ptr: *const c_void,
+        batch_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        sm_scale: f32,
+        workspace_float: *mut c_void,
+        workspace_float_size: usize,
+        workspace_int: *mut c_void,
+        workspace_int_size: usize,
+        page_locked_int_buffer: *mut c_void,
+        page_locked_int_size: usize,
+        mask_mode: i32,
+        out_data_type: i32,
+        stream: i64,
+    ) -> i32;
+
     #[cfg(feature = "flashinfer")]
     pub fn flashinfer_prefill_wrapper_fp8(
         out_ptr: *mut c_void,

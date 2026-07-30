@@ -6,6 +6,8 @@ use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_core::cuda_backend::WrapErr;
 use candle_core::{CudaStorage, DType, Layout, Result, Storage, Tensor};
 
+pub use crate::ragged_prefill::{CheckedRaggedLengths, RaggedMask, prefill_ragged_with_mask};
+
 // Re-export workspace functions and constants for backward compatibility with external callers
 #[allow(unused_imports)]
 pub(crate) use crate::workspace::{
