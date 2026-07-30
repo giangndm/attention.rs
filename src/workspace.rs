@@ -203,11 +203,11 @@ mod cuda {
 
     thread_local! {
         /// Primary FlashInfer workspace (normal operations).
-        #[cfg(feature = "flashinfer")]
+        #[cfg(any(feature = "flashinfer", feature = "ragged-prefill"))]
         pub static WORKSPACE: std::cell::RefCell<Option<FlashInferWorkspace>> = const { std::cell::RefCell::new(None) };
 
         /// FlashInfer workspace for CUDA graph captures (separate to avoid interference).
-        #[cfg(feature = "flashinfer")]
+        #[cfg(any(feature = "flashinfer", feature = "ragged-prefill"))]
         pub static WORKSPACE_GRAPH: std::cell::RefCell<Option<FlashInferWorkspace>> = const { std::cell::RefCell::new(None) };
 
         /// Dedicated CUTLASS workspace.
@@ -222,7 +222,7 @@ mod cuda {
     /// Initializes or retrieves the FlashInfer workspace for the given device.
     ///
     /// Returns (float_ptr, int_ptr, pinned_host_ptr, pinned_host_size).
-    #[cfg(feature = "flashinfer")]
+    #[cfg(any(feature = "flashinfer", feature = "ragged-prefill"))]
     pub fn get_or_init_workspace(
         dev: &candle_core::cuda_backend::CudaDevice,
         for_cuda_graph: bool,
@@ -271,7 +271,7 @@ mod cuda {
     /// Returns workspace pointers for FlashInfer plan operations.
     ///
     /// Returns (float_ptr, float_size, int_ptr, int_size, page_locked_ptr, page_locked_size).
-    #[cfg(feature = "flashinfer")]
+    #[cfg(any(feature = "flashinfer", feature = "ragged-prefill"))]
     pub fn get_plan_workspace(
         dev: &candle_core::cuda_backend::CudaDevice,
         for_cuda_graph: bool,

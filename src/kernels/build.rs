@@ -74,6 +74,8 @@ fn main() -> Result<()> {
     let marlin_disabled = std::env::var("CARGO_FEATURE_NO_MARLIN").is_ok();
     let fp8_kvcache_disabled = std::env::var("CARGO_FEATURE_NO_FP8_KVCACHE").is_ok();
     let trtllm_enabled = std::env::var("CARGO_FEATURE_TRTLLM").is_ok();
+    let flashinfer_enabled = std::env::var("CARGO_FEATURE_FLASHINFER").is_ok();
+    let ragged_prefill_enabled = std::env::var("CARGO_FEATURE_RAGGED_PREFILL").is_ok();
 
     let build_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap_or_default());
 
@@ -110,6 +112,19 @@ fn main() -> Result<()> {
         }
     }
 
+    if ragged_prefill_enabled && !flashinfer_enabled {
+        builder = builder.exclude(&[
+            "flashinfer_adapter_decode.cu",
+            "flashinfer_adapter_fp8.cu",
+            "flashinfer_bmm_fp8.cu",
+            "flashinfer_fp8_qquant.cu",
+            "flashinfer_mla.cu",
+            "flashinfer_moe_adapter.cu",
+            "flashinfer_prefill_fp8_fa2.cu",
+            "nvfp4_gemm_flashinfer.cu",
+        ]);
+    }
+
     println!("cargo:info=compute capability: {:?}", compute_cap);
 
     if compute_cap < 80 {
@@ -125,6 +140,7 @@ fn main() -> Result<()> {
         builder = builder.arg("-DNVFP4_BLACKWELL");
     }
 
+
     if marlin_disabled {
         builder = builder.arg("-DNO_MARLIN_KERNEL");
     }
@@ -134,7 +150,8 @@ fn main() -> Result<()> {
     }
 
     if std::env::var("CARGO_FEATURE_CUTLASS").is_ok()
-        || std::env::var("CARGO_FEATURE_FLASHINFER").is_ok()
+        || flashinfer_enabled
+        || ragged_prefill_enabled
     {
         builder = builder
             .arg("-DUSE_CUTLASS")
@@ -152,31 +169,40 @@ fn main() -> Result<()> {
             builder = builder.arg("-DENABLE_FP4_SM120");
         }
 
-        if std::env::var("CARGO_FEATURE_FLASHINFER").is_ok() {
-            builder = builder.arg("-DENABLE_BF16").arg("-DENABLE_FP8");
+        if flashinfer_enabled || ragged_prefill_enabled {
+            builder = builder.arg("-DENABLE_BF16");
+            if flashinfer_enabled {
+                builder = builder.arg("-DENABLE_FP8");
+            }
             if compute_cap >= 89 {
-                builder = builder.arg("-DFLASHINFER_ENABLE_FP8_E8M0");
+                if flashinfer_enabled {
+                    builder = builder.arg("-DFLASHINFER_ENABLE_FP8_E8M0");
+                }
             }
             if (90..100).contains(&compute_cap) {
                 builder = builder.arg("-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED");
                 builder = builder.arg("-DSM_90_PASS");
             }
             let flashinfer_sw_fp8 = std::env::var("ENABLE_FLASHINFER_SOFTWARE_FP8").is_ok();
-            if compute_cap >= 90 || (compute_cap >= 80 && flashinfer_sw_fp8) {
+            if flashinfer_enabled
+                && (compute_cap >= 90 || (compute_cap >= 80 && flashinfer_sw_fp8))
+            {
                 builder = builder.arg("-DFLASHINFER_ENABLE_FP8_E4M3");
             }
-            if compute_cap >= 90 {
+            if flashinfer_enabled && compute_cap >= 90 {
                 builder = builder.arg("-DFLASHINFER_ENABLE_FP4_E2M1");
             }
         }
     }
 
-    if std::env::var("CARGO_FEATURE_FLASHINFER").is_ok() {
+    if flashinfer_enabled || ragged_prefill_enabled {
         println!("cargo:rerun-if-changed=src/flashinfer_common.cuh");
-        println!("cargo:rerun-if-changed=src/flashinfer_adapter_decode.cu");
         println!("cargo:rerun-if-changed=src/flashinfer_adapter_prefill.cu");
-        println!("cargo:rerun-if-changed=src/flashinfer_prefill_fp8_fa2.cu");
-        println!("cargo:rerun-if-changed=src/flashinfer_mla.cu");
+        if flashinfer_enabled {
+            println!("cargo:rerun-if-changed=src/flashinfer_adapter_decode.cu");
+            println!("cargo:rerun-if-changed=src/flashinfer_prefill_fp8_fa2.cu");
+            println!("cargo:rerun-if-changed=src/flashinfer_mla.cu");
+        }
         // Custom flashinfer v0.6.7 with GQA fixes (guoqingbao fork)
         // Synced with CUTLASS 4.4.2 (da5e086d) for SM100+/SM121 support
         builder = builder.arg("-DUSE_FLASHINFER").with_git_dependency(
@@ -202,7 +228,7 @@ fn main() -> Result<()> {
         let csrc_dir = flashinfer_root.join("csrc");
         let trtllm_dir = csrc_dir.join("nv_internal").join("tensorrt_llm");
 
-        if compute_cap >= 90 && trtllm_dir.exists() {
+        if flashinfer_enabled && compute_cap >= 90 && trtllm_dir.exists() {
             let include_define = format!(
                 "-DATTENTION_RS_FLASHINFER_TRTLLM_INCLUDE_DIR=\\\"{}\\\"",
                 trtllm_dir.display()
@@ -225,7 +251,7 @@ fn main() -> Result<()> {
                     csrc_dir.join("nv_internal/cpp/common/memoryUtils.cu"),
                     csrc_dir.join("nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp"),
                 ]);
-        } else if compute_cap >= 90 {
+        } else if flashinfer_enabled && compute_cap >= 90 {
             println!(
                 "cargo:warning=flashinfer TensorRT-LLM sources not found at {}, skipping blockscale fp8 wrapper",
                 trtllm_dir.display()
