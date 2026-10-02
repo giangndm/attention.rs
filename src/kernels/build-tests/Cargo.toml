@@ -6,6 +6,8 @@ publish = false
 
 [dependencies]
 sha2 = "0.10"
+fs2 = "0.4"
+anyhow = "1"
 
 [lib]
 path = "flashinfer_overlay_fingerprint.rs"

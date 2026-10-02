@@ -1,9 +1,11 @@
 #[path = "build_support/flashinfer_overlay_fingerprint.rs"]
 mod flashinfer_overlay_fingerprint;
+#[path = "build_support/native_cache.rs"]
+mod native_cache;
 mod trtllm_artifacts;
 
 use anyhow::{bail, Context, Result};
-use cudaforge::KernelBuilder;
+use cudaforge::{CudaToolkit, KernelBuilder};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -90,7 +92,9 @@ fn main() -> Result<()> {
     let fp8_kvcache_disabled = std::env::var("CARGO_FEATURE_NO_FP8_KVCACHE").is_ok();
     let trtllm_enabled = std::env::var("CARGO_FEATURE_TRTLLM").is_ok();
 
-    let build_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap_or_default());
+    let build_dir = PathBuf::from(std::env::var("OUT_DIR").context("OUT_DIR is required")?);
+    let target_root = native_cache::target_root(&build_dir)?;
+    let cache_root = target_root.join("attention-native");
 
     let mut builder = KernelBuilder::new()
         .source_dir("src")
@@ -102,6 +106,7 @@ fn main() -> Result<()> {
         .max_threads(8)
         .arg("--expt-relaxed-constexpr")
         .arg("-O3");
+    let mut external_inputs = Vec::<PathBuf>::new();
 
     let flash_enabled = std::env::var("CARGO_FEATURE_FLASH").is_ok();
     let flashinfer_enabled = std::env::var("CARGO_FEATURE_FLASHINFER").is_ok();
@@ -161,6 +166,12 @@ fn main() -> Result<()> {
         builder = builder
             .arg("-DUSE_CUTLASS")
             .with_cutlass(Some("da5e086dab31d63815acafdac9a9c5893b1c69e2"));
+
+        let cutlass_root = builder.fetch_git_dependency("cutlass")?;
+        external_inputs.extend([
+            cutlass_root.join("include"),
+            cutlass_root.join("tools/util/include"),
+        ]);
 
         if compute_cap >= 100 {
             builder = builder
@@ -230,7 +241,15 @@ fn main() -> Result<()> {
         );
 
         let flashinfer_root = builder.fetch_git_dependency("flashinfer")?;
-        let flashinfer_overlay = prepare_flashinfer_prefill_overlay(&flashinfer_root, &build_dir)?;
+        external_inputs.extend([
+            flashinfer_root.join("include"),
+            flashinfer_root.join("csrc/nv_internal"),
+            flashinfer_root.join("csrc/nv_internal/include"),
+            flashinfer_root.join("csrc/nv_internal/tensorrt_llm/cutlass_extensions/include"),
+            flashinfer_root.join("csrc/nv_internal/cpp/common"),
+            flashinfer_root.join("csrc/nv_internal/tensorrt_llm"),
+        ]);
+        let flashinfer_overlay = prepare_flashinfer_prefill_overlay(&flashinfer_root, &cache_root)?;
         let applied_overlay = flashinfer_overlay.join("include/flashinfer/attention/prefill.cuh");
         let overlay_fingerprint_arg =
             flashinfer_overlay_fingerprint::cuda_object_fingerprint_arg(&applied_overlay)
@@ -282,7 +301,7 @@ fn main() -> Result<()> {
             );
         }
         if trtllm_enabled && compute_cap >= 100 {
-            let trtllm_cache = build_dir.join("trtllm_artifacts");
+            let trtllm_cache = cache_root.join("trtllm_artifacts");
             std::fs::create_dir_all(&trtllm_cache)?;
 
             // The bmm_export headers go into the FlashInfer include tree so that
@@ -318,6 +337,11 @@ fn main() -> Result<()> {
                     let fmha_meta_hash =
                         trtllm_artifacts::download_fmha_metainfo(&trtllm_cache, &fmha_include_dir)
                             .unwrap_or_default();
+                    external_inputs.extend([
+                        bmm_include_dir.clone(),
+                        gemm_include_dir.clone(),
+                        fmha_include_dir.clone(),
+                    ]);
 
                     builder = builder
                         .arg("-DUSE_TRTLLM")
@@ -413,18 +437,90 @@ fn main() -> Result<()> {
             flash_builder = flash_builder.arg("-D_USE_MATH_DEFINES");
         }
 
-        println!("cargo:info=native flash: {flash_builder:?}");
-        let _ = flash_builder.build_lib(build_dir.join("libnativeflash.a"))?;
-    }
-
-    println!("cargo:info=core: {builder:?}");
-
-    let _ = builder.build_lib(build_dir.join("libpagedattention.a"))?;
-
-    println!("cargo:rustc-link-search={}", build_dir.display());
-    if flash_enabled {
+        let flash_sources =
+            native_cache::local_inputs(Path::new("src"), true, flashinfer_enabled, trtllm_enabled)?;
+        let mut flash_watch = flash_sources.clone();
+        flash_watch.push(PathBuf::from("src/flash"));
+        flash_watch.extend([
+            PathBuf::from("build.rs"),
+            PathBuf::from("trtllm_artifacts.rs"),
+            PathBuf::from("build_support"),
+        ]);
+        native_cache::emit_cargo_watches(&flash_watch);
+        let toolkit = CudaToolkit::detect().context("detect CUDA toolkit for native cache key")?;
+        let flash_fingerprint = fingerprint_builder(
+            &flash_builder,
+            &build_dir,
+            &flash_sources,
+            &[],
+            &toolkit,
+            "nativeflash",
+            compute_cap,
+        )?;
+        println!("cargo:info=native flash cache fingerprint: {flash_fingerprint}");
+        let flash_archive = native_cache::get_or_build(
+            &cache_root,
+            "libnativeflash.a",
+            &flash_fingerprint,
+            |object_dir, temporary_archive| {
+                flash_builder
+                    .out_dir(object_dir.to_path_buf())
+                    .no_incremental()
+                    .build_lib(temporary_archive)?;
+                Ok(())
+            },
+        )?;
+        println!(
+            "cargo:rustc-link-search={}",
+            flash_archive
+                .parent()
+                .context("flash archive has no parent")?
+                .display()
+        );
         println!("cargo:rustc-link-lib=nativeflash");
     }
+
+    let core_sources =
+        native_cache::local_inputs(Path::new("src"), false, flashinfer_enabled, trtllm_enabled)?;
+    let mut core_watch = core_sources.clone();
+    core_watch.extend(external_inputs.iter().cloned());
+    core_watch.extend([
+        PathBuf::from("src"),
+        PathBuf::from("build.rs"),
+        PathBuf::from("trtllm_artifacts.rs"),
+        PathBuf::from("build_support"),
+    ]);
+    native_cache::emit_cargo_watches(&core_watch);
+    let toolkit = CudaToolkit::detect().context("detect CUDA toolkit for native cache key")?;
+    let core_fingerprint = fingerprint_builder(
+        &builder,
+        &build_dir,
+        &core_sources,
+        &external_inputs,
+        &toolkit,
+        "pagedattention",
+        compute_cap,
+    )?;
+    println!("cargo:info=core cache fingerprint: {core_fingerprint}");
+    let core_archive = native_cache::get_or_build(
+        &cache_root,
+        "libpagedattention.a",
+        &core_fingerprint,
+        |object_dir, temporary_archive| {
+            builder
+                .out_dir(object_dir.to_path_buf())
+                .no_incremental()
+                .build_lib(temporary_archive)?;
+            Ok(())
+        },
+    )?;
+    println!(
+        "cargo:rustc-link-search={}",
+        core_archive
+            .parent()
+            .context("core archive has no parent")?
+            .display()
+    );
     println!("cargo:rustc-link-lib=pagedattention");
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=cublas");
@@ -432,20 +528,140 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn prepare_flashinfer_prefill_overlay(flashinfer_root: &Path, build_dir: &Path) -> Result<PathBuf> {
+/// Hash the effective builder configuration, compiler identity, selected GPU
+/// architecture, and all source/dependency bytes before consulting the cache.
+fn fingerprint_builder(
+    builder: &KernelBuilder,
+    out_dir: &Path,
+    local_sources: &[PathBuf],
+    dependency_paths: &[PathBuf],
+    toolkit: &CudaToolkit,
+    archive: &str,
+    compute_cap: usize,
+) -> Result<String> {
+    let debug = format!("{builder:?}").replace(&out_dir.display().to_string(), "<CARGO_OUT_DIR>");
+    let nvcc_version =
+        native_cache::tool_version(&toolkit.nvcc_path.to_string_lossy(), &["--version"])?;
+    let arch_list =
+        native_cache::tool_version(&toolkit.nvcc_path.to_string_lossy(), &["--list-gpu-code"])?;
+    let mut host_paths = Vec::new();
+    let host_identity = if let Ok(host_compiler) = std::env::var("NVCC_CCBIN") {
+        let host_compiler = PathBuf::from(host_compiler);
+        let host_compiler = if host_compiler.is_dir() {
+            host_compiler.join(
+                if std::env::var("TARGET").is_ok_and(|target| target.contains("msvc")) {
+                    "cl.exe"
+                } else {
+                    "g++"
+                },
+            )
+        } else {
+            host_compiler
+        };
+        let path = native_cache::resolve_program(&host_compiler.to_string_lossy())?;
+        let identity = if std::env::var("TARGET").is_ok_and(|target| target.contains("msvc")) {
+            format!(
+                "NVCC_CCBIN={} bytes={:?}",
+                path.display(),
+                fs::read(&path)?.len()
+            )
+        } else {
+            native_cache::tool_version(&path.to_string_lossy(), &["--version"])?
+        };
+        host_paths.push(path);
+        identity
+    } else if std::env::var("TARGET").is_ok_and(|target| target.contains("msvc")) {
+        let path = native_cache::resolve_program("cl.exe")?;
+        let identity = format!(
+            "MSVC host={} bytes={:?}",
+            path.display(),
+            fs::read(&path)?.len()
+        );
+        host_paths.push(path);
+        identity
+    } else {
+        let mut identities = Vec::new();
+        for compiler in ["gcc", "g++"] {
+            let path = native_cache::resolve_program(compiler)?;
+            identities.push(native_cache::tool_version(
+                &path.to_string_lossy(),
+                &["--version"],
+            )?);
+            host_paths.push(path);
+        }
+        identities.join("\n")
+    };
+    let mut recipe = format!(
+        "archive={archive}\ncompute-cap={compute_cap}\ntoolkit={:?}\nnvcc={nvcc_version}\narch-list={arch_list}\nhost={host_identity}\nenv={}\nbuilder={debug}",
+        toolkit.nvcc_path,
+        native_cache::environment_recipe(),
+    );
+    recipe.push_str("\nrecipe-version=1");
+    let mut inputs = local_sources.to_vec();
+    inputs.extend(dependency_paths.iter().cloned());
+    inputs.extend([
+        PathBuf::from("Cargo.toml"),
+        PathBuf::from("build.rs"),
+        PathBuf::from("trtllm_artifacts.rs"),
+        PathBuf::from("build_support"),
+        toolkit.nvcc_path.clone(),
+        toolkit.include_dir.clone(),
+    ]);
+    if let Some(cuda_root) = toolkit.nvcc_path.parent().and_then(Path::parent) {
+        let libdevice = cuda_root.join("nvvm/libdevice");
+        if libdevice.exists() {
+            inputs.push(libdevice);
+        }
+    }
+    inputs.extend(host_paths);
+    native_cache::emit_cargo_watches(&inputs);
+    native_cache::fingerprint(&recipe, &inputs)
+}
+
+fn prepare_flashinfer_prefill_overlay(
+    flashinfer_root: &Path,
+    cache_root: &Path,
+) -> Result<PathBuf> {
+    use fs2::FileExt;
     let patch =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("patches/flashinfer-fp8-paged-repack.patch");
     let source = flashinfer_root.join("include/flashinfer/attention/prefill.cuh");
-    let overlay = build_dir.join("flashinfer-prefill-overlay");
+    let input_key =
+        native_cache::fingerprint("flashinfer-overlay-v1", &[source.clone(), patch.clone()])?;
+    let overlay_root = cache_root.join("overlays");
+    fs::create_dir_all(&overlay_root).context("create shared overlay cache")?;
+    let lock_path = overlay_root.join(format!("flashinfer-prefill-{input_key}.lock"));
+    let lock = fs::File::create(&lock_path).context("create FlashInfer overlay lock")?;
+    lock.lock_exclusive()
+        .context("lock FlashInfer overlay publication")?;
+    let overlay = overlay_root.join(format!("flashinfer-prefill-{input_key}"));
     let destination = overlay.join("include/flashinfer/attention/prefill.cuh");
 
+    let completion = overlay.join("complete.sha256");
+    println!("cargo:rerun-if-changed={}", destination.display());
+    println!("cargo:rerun-if-changed={}", completion.display());
+    if destination.is_file()
+        && fs::read_to_string(&completion).ok().as_deref()
+            == Some(native_cache::hash_file(&destination)?.as_str())
+    {
+        return Ok(overlay);
+    }
+    let temporary_overlay = overlay_root.join(format!(
+        "flashinfer-prefill-{input_key}.tmp-{}",
+        std::process::id()
+    ));
+    if temporary_overlay.exists() {
+        fs::remove_dir_all(&temporary_overlay).context("remove incomplete FlashInfer overlay")?;
+    }
+    let temporary_destination = temporary_overlay.join("include/flashinfer/attention/prefill.cuh");
+
     fs::create_dir_all(
-        destination
+        temporary_destination
             .parent()
             .context("overlay header has no parent")?,
     )
     .context("failed to create FlashInfer prefill overlay")?;
-    fs::copy(&source, &destination).with_context(|| {
+    fs::copy(&source, &temporary_destination).with_context(|| {
         format!(
             "failed to copy pinned FlashInfer header from {}",
             source.display()
@@ -458,7 +674,7 @@ fn prepare_flashinfer_prefill_overlay(flashinfer_root: &Path, build_dir: &Path) 
             .current_dir(std::env::temp_dir())
             .arg("apply")
             .arg("--unsafe-paths")
-            .arg(format!("--directory={}", overlay.display()));
+            .arg(format!("--directory={}", temporary_overlay.display()));
         if check_only {
             command.arg("--check");
         }
@@ -475,5 +691,16 @@ fn prepare_flashinfer_prefill_overlay(flashinfer_root: &Path, build_dir: &Path) 
         }
     }
 
+    fs::write(
+        temporary_overlay.join("complete.sha256"),
+        native_cache::hash_file(&temporary_destination)?,
+    )
+    .context("record completed FlashInfer overlay")?;
+    // A deleted header or failed earlier publication can leave a partial entry.
+    // The per-key lock keeps recovery serialized with other overlay builders.
+    if overlay.exists() {
+        fs::remove_dir_all(&overlay).context("remove incomplete FlashInfer overlay entry")?;
+    }
+    fs::rename(&temporary_overlay, &overlay).context("publish FlashInfer overlay")?;
     Ok(overlay)
 }
