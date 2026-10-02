@@ -12,6 +12,7 @@ license = "MIT OR Apache-2.0"
 cudaforge = "0.1.6"
 anyhow = { version = "1", features = ["backtrace"] }
 sha2 = "0.10"
+fs2 = "0.4"
 ureq = { version = "2.10", default-features = true }
 
 [features]

@@ -4,6 +4,8 @@ mod trtllm_artifacts;
 
 use anyhow::{bail, Context, Result};
 use cudaforge::KernelBuilder;
+use fs2::FileExt;
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -90,7 +92,7 @@ fn main() -> Result<()> {
     let fp8_kvcache_disabled = std::env::var("CARGO_FEATURE_NO_FP8_KVCACHE").is_ok();
     let trtllm_enabled = std::env::var("CARGO_FEATURE_TRTLLM").is_ok();
 
-    let build_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap_or_default());
+    let cargo_out_dir = PathBuf::from(std::env::var("OUT_DIR").context("OUT_DIR is required")?);
 
     let mut builder = KernelBuilder::new()
         .source_dir("src")
@@ -118,6 +120,43 @@ fn main() -> Result<()> {
     }
 
     let compute_cap = builder.get_compute_cap().unwrap_or(80);
+
+    // Share CudaForge's existing incremental cache across Cargo profiles.
+    // Keep native feature sets separate so concurrent links use the right archive.
+    let mut features: Vec<_> = std::env::vars()
+        .filter(|(name, _)| name.starts_with("CARGO_FEATURE_"))
+        .map(|(name, _)| name)
+        .collect();
+    features.sort();
+    let build_dir = cargo_out_dir
+        .ancestors()
+        .nth(4)
+        .context("expected Cargo OUT_DIR under <target>/<profile>/build/<package>/out")?
+        .join("attention-native")
+        .join(format!("sm{compute_cap}-{}", features.join("-")));
+    fs::create_dir_all(&build_dir).context("create shared native build directory")?;
+    let cache_lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(build_dir.join(".lock"))?;
+    cache_lock
+        .lock_exclusive()
+        .context("lock shared native build directory")?;
+
+    builder = builder.out_dir(build_dir.join("core")).watch(["src"]);
+    println!("cargo:rerun-if-changed=src");
+    println!(
+        "cargo:rerun-if-changed={}",
+        build_dir.join("libpagedattention.a").display()
+    );
+    if flash_enabled {
+        println!(
+            "cargo:rerun-if-changed={}",
+            build_dir.join("libnativeflash.a").display()
+        );
+    }
 
     if flash_enabled {
         if compute_cap <= 70 {
@@ -380,6 +419,7 @@ fn main() -> Result<()> {
 
     if flash_enabled {
         let mut flash_builder = KernelBuilder::new()
+            .out_dir(build_dir.join("flash"))
             .source_files([
                 "src/flash/flash_instantiate.cu",
                 "src/flash/flash_decode.cu",
@@ -414,12 +454,12 @@ fn main() -> Result<()> {
         }
 
         println!("cargo:info=native flash: {flash_builder:?}");
-        let _ = flash_builder.build_lib(build_dir.join("libnativeflash.a"))?;
+        build_archive(&flash_builder, &build_dir.join("libnativeflash.a"))?;
     }
 
     println!("cargo:info=core: {builder:?}");
 
-    let _ = builder.build_lib(build_dir.join("libpagedattention.a"))?;
+    build_archive(&builder, &build_dir.join("libpagedattention.a"))?;
 
     println!("cargo:rustc-link-search={}", build_dir.display());
     if flash_enabled {
@@ -432,12 +472,38 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// A failed re-archive must not leave an old library that CudaForge could
+/// mistakenly consider up to date after updating its object cache.
+fn build_archive(builder: &KernelBuilder, archive: &Path) -> Result<()> {
+    if let Err(error) = builder.build_lib(archive) {
+        if archive.exists() {
+            fs::remove_file(archive).context("remove incomplete native archive")?;
+        }
+        return Err(error.into());
+    }
+    Ok(())
+}
+
 fn prepare_flashinfer_prefill_overlay(flashinfer_root: &Path, build_dir: &Path) -> Result<PathBuf> {
     let patch =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("patches/flashinfer-fp8-paged-repack.patch");
     let source = flashinfer_root.join("include/flashinfer/attention/prefill.cuh");
     let overlay = build_dir.join("flashinfer-prefill-overlay");
     let destination = overlay.join("include/flashinfer/attention/prefill.cuh");
+    let stamp = overlay.join(".fingerprint");
+    let inputs = format!(
+        "{:x}{:x}",
+        Sha256::digest(fs::read(&source)?),
+        Sha256::digest(fs::read(&patch)?)
+    );
+    // Reuse the applied header without rewriting its mtime on each Cargo build.
+    // Source/patch changes or a missing/corrupt overlay recreate it under the lock.
+    if destination.is_file() {
+        let expected = format!("{inputs}\n{:x}", Sha256::digest(fs::read(&destination)?));
+        if fs::read_to_string(&stamp).ok().as_deref() == Some(expected.as_str()) {
+            return Ok(overlay);
+        }
+    }
 
     fs::create_dir_all(
         destination
@@ -475,5 +541,9 @@ fn prepare_flashinfer_prefill_overlay(flashinfer_root: &Path, build_dir: &Path) 
         }
     }
 
+    fs::write(
+        stamp,
+        format!("{inputs}\n{:x}", Sha256::digest(fs::read(&destination)?)),
+    )?;
     Ok(overlay)
 }
