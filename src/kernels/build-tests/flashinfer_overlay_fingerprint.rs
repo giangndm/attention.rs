@@ -3,9 +3,6 @@
 #[path = "../build_support/flashinfer_overlay_fingerprint.rs"]
 mod flashinfer_overlay_fingerprint;
 
-#[path = "../build_support/native_cache.rs"]
-mod native_cache;
-
 #[cfg(test)]
 mod tests {
     use super::flashinfer_overlay_fingerprint::cuda_object_fingerprint_arg;
