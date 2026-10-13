@@ -159,14 +159,25 @@ void flashinfer_prefill_run_fp8_fa2(
                 tmp_s = GetPtrFromBaseOffset<float>(workspace_float, plan_info.s_offset);
             }
 
+            const bool use_swa = (window_left > 0);
             DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
-                using AttentionType = DefaultAttentionAlias<false, false, false, false>;
-                BatchPrefillWithPagedKVCacheDispatched<
-                    CTA_TILE_Q, HEAD_DIM, HEAD_DIM,
-                    PosEncodingMode::kNone, false, MaskMode::kCausal,
-                    AttentionType, ParamsType>(
-                    params, tmp_v, tmp_s, false, stream
-                );
+                if (use_swa) {
+                    using AttentionType = DefaultAttentionAlias<false, true, false, false>;
+                    BatchPrefillWithPagedKVCacheDispatched<
+                        CTA_TILE_Q, HEAD_DIM, HEAD_DIM,
+                        PosEncodingMode::kNone, false, MaskMode::kCausal,
+                        AttentionType, ParamsType>(
+                        params, tmp_v, tmp_s, false, stream
+                    );
+                } else {
+                    using AttentionType = DefaultAttentionAlias<false, false, false, false>;
+                    BatchPrefillWithPagedKVCacheDispatched<
+                        CTA_TILE_Q, HEAD_DIM, HEAD_DIM,
+                        PosEncodingMode::kNone, false, MaskMode::kCausal,
+                        AttentionType, ParamsType>(
+                        params, tmp_v, tmp_s, false, stream
+                    );
+                }
             });
         });
     };

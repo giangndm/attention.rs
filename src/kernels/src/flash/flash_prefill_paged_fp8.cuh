@@ -281,7 +281,7 @@ flash_prefill_paged_fp8(
         unsigned int kv_start = kv_block * BC;
         unsigned int kv_end = min(kv_start + BC, kv_len);
         unsigned int kv_tile_len = kv_end - kv_start;
-        unsigned int buf = kv_block & 1;
+        unsigned int buf = (kv_block - kv_block_start) & 1;
 
         // V load (synchronous FP8 dequant, overlaps temporally with QK^T on warps 0-1)
         LOAD_KV_TILE_FP8(V_cache, block_table, smem_V, kv_start, kv_len, kv_head, tid, NUM_THREADS, v_scale);

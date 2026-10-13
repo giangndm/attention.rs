@@ -77,6 +77,7 @@ template <bool use_custom_mask, bool use_sliding_window, bool use_logits_soft_ca
 using DefaultAttentionAlias =
     DefaultAttention<use_custom_mask, use_sliding_window, use_logits_soft_cap, use_alibi>;
 using DefaultDecodeAttention = DefaultAttentionAlias<false, false, false, false>;
+using SlidingWindowDecodeAttention = DefaultAttentionAlias<false, true, false, false>;
 #else // SM_90_PASS defined (Hopper FA3 path)
 template <bool use_custom_mask, bool use_sliding_window, bool use_logits_soft_cap, bool use_alibi>
 using DefaultAttentionAlias = DefaultAttention<use_logits_soft_cap>;
@@ -130,6 +131,7 @@ struct DefaultDecodeAttention {
         return output * d_rcp;
     }
 };
+using SlidingWindowDecodeAttention = DefaultDecodeAttention;
 #endif
 
 #if defined(SM_90_PASS)

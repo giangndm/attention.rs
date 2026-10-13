@@ -340,7 +340,6 @@ void flashinfer_decode_run_wrapper(
                 std::vector<int64_t> vec(plan_info_vec, plan_info_vec + 10);
                 plan_info.FromVector(vec);
 
-                using AttentionType = DefaultDecodeAttention;
                 using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
 
                 ParamsType params(
@@ -368,10 +367,15 @@ void flashinfer_decode_run_wrapper(
                     tmp_s = GetPtrFromBaseOffset<float>(workspace_float, plan_info.s_offset);
                 }
 
-                BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, PosEncodingMode::kNone,
-                        AttentionType, ParamsType>(
-                        params, tmp_v, tmp_s, false, stream
-                );
+                if (window_left > 0) {
+                    BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, PosEncodingMode::kNone,
+                            SlidingWindowDecodeAttention, ParamsType>(
+                            params, tmp_v, tmp_s, false, stream);
+                } else {
+                    BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, PosEncodingMode::kNone,
+                            DefaultDecodeAttention, ParamsType>(
+                            params, tmp_v, tmp_s, false, stream);
+                }
             });
         };
 
@@ -404,7 +408,6 @@ void flashinfer_decode_run_wrapper(
             std::vector<int64_t> vec(plan_info_vec, plan_info_vec + 10);
             plan_info.FromVector(vec);
 
-            using AttentionType = DefaultDecodeAttention;
             using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
 
             ParamsType params(
@@ -432,10 +435,15 @@ void flashinfer_decode_run_wrapper(
                 tmp_s = GetPtrFromBaseOffset<float>(workspace_float, plan_info.s_offset);
             }
 
-            BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, PosEncodingMode::kNone,
-                    AttentionType, ParamsType>(
-                    params, tmp_v, tmp_s, false, stream
-            );
+            if (window_left > 0) {
+                BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, PosEncodingMode::kNone,
+                        SlidingWindowDecodeAttention, ParamsType>(
+                        params, tmp_v, tmp_s, false, stream);
+            } else {
+                BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, PosEncodingMode::kNone,
+                        DefaultDecodeAttention, ParamsType>(
+                        params, tmp_v, tmp_s, false, stream);
+            }
         });
     };
 
