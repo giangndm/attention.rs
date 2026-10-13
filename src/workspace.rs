@@ -7,10 +7,10 @@
 //! # Workspace Layout (when `flashinfer` feature is enabled)
 //!
 //! ```text
-//! FLASHINFER FLOAT BUFFER (512 MiB total):
+//! FLASHINFER FLOAT BUFFER (640 MiB total):
 //! ┌─────────────────────────────────────────────────────────────────┐
-//! │  FlashInfer Plan Float (256 MiB)  │  FlashInfer Scratch (256 MiB)
-//! │  [0..256 MiB)                     │  [256 MiB..512 MiB)        │
+//! │  FlashInfer Plan Float (384 MiB)  │  FlashInfer Scratch (256 MiB)
+//! │  [0..384 MiB)                     │  [384 MiB..640 MiB)        │
 //! └─────────────────────────────────────────────────────────────────┘
 //!
 //! INT BUFFER (128 MiB):
@@ -41,14 +41,18 @@ use candle_core::cuda_backend::cudarc::driver::{sys, CudaSlice, DevicePtr};
 use candle_core::cuda_backend::WrapErr;
 use candle_core::Result;
 
-/// Total size of the float workspace buffer (512 MiB).
-pub const WORKSPACE_FLOAT_SIZE: usize = 512 * 1024 * 1024;
+/// Total size of the disjoint plan and GEMM float regions (640 MiB).
+pub const WORKSPACE_FLOAT_SIZE: usize = FLASHINFER_PLAN_FLOAT_SIZE + GEMM_SCRATCH_FLOAT_SIZE;
 
 /// Size of the int workspace buffer (128 MiB).
 pub const WORKSPACE_INT_SIZE: usize = 128 * 1024 * 1024;
 
 /// Size of the FlashInfer plan region within the float buffer.
-pub const FLASHINFER_PLAN_FLOAT_SIZE: usize = 256 * 1024 * 1024;
+///
+/// Muse Q32/KV2/D128 non-graph split plans on a 170-SM GPU need at most
+/// 342.65625 MiB for temporary V/S buffers. Keep GEMM scratch disjoint;
+/// larger geometries must report a planning error rather than alias scratch.
+pub const FLASHINFER_PLAN_FLOAT_SIZE: usize = 384 * 1024 * 1024;
 
 /// Offset where GEMM scratch space begins within the float buffer.
 pub const GEMM_SCRATCH_FLOAT_OFFSET: usize = FLASHINFER_PLAN_FLOAT_SIZE;
@@ -675,9 +679,9 @@ mod tests {
 
     #[test]
     fn constants_are_consistent() {
-        assert_eq!(WORKSPACE_FLOAT_SIZE, 512 * 1024 * 1024);
+        assert_eq!(WORKSPACE_FLOAT_SIZE, 640 * 1024 * 1024);
         assert_eq!(WORKSPACE_INT_SIZE, 128 * 1024 * 1024);
-        assert_eq!(FLASHINFER_PLAN_FLOAT_SIZE, 256 * 1024 * 1024);
+        assert_eq!(FLASHINFER_PLAN_FLOAT_SIZE, 384 * 1024 * 1024);
         assert_eq!(GEMM_SCRATCH_FLOAT_SIZE, 256 * 1024 * 1024);
         assert_eq!(GEMM_SCRATCH_FLOAT_OFFSET, FLASHINFER_PLAN_FLOAT_SIZE);
     }

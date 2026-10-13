@@ -355,3 +355,66 @@ fn flashinfer_multi_chunk_matches_one_shot_cache_and_output() -> Result<()> {
     assert_output_parity(&one_shot.output, &chunked.output);
     Ok(())
 }
+
+/// An allocator failure must remain inside the C ABI, then a mixed plan must work.
+#[test]
+#[ignore = "requires GPU0 with FlashInfer"]
+fn flashinfer_prefill_plan_contains_workspace_exception() -> Result<()> {
+    assert_eq!(std::env::var("CUDA_VISIBLE_DEVICES").as_deref(), Ok("0"));
+    let device = Device::new_cuda(0)?;
+    let cuda = device.as_cuda_device()?;
+    let (float_ptr, float_size, int_ptr, _, host_ptr, host_size) =
+        attention_rs::workspace::get_plan_workspace(cuda, false)?;
+    let query = [0_i32, 1];
+    let pages = [0_i32, 1];
+    let lengths = [1_i32];
+    // Start with an apparently valid tag: the wrapper must invalidate it itself.
+    let mut failed_plan = [0_i64; 16];
+    // SAFETY: All pointers reference live allocations/arrays. Advertising one byte
+    // of int capacity forces the first allocator check before host writes/copies.
+    unsafe {
+        attention_rs::kernels::ffi::flashinfer_prefill_plan_wrapper(
+            query.as_ptr(),
+            pages.as_ptr(),
+            lengths.as_ptr(),
+            1,
+            1,
+            32,
+            2,
+            128,
+            32,
+            false,
+            -1,
+            1,
+            float_ptr,
+            float_size,
+            int_ptr,
+            1,
+            host_ptr,
+            host_size,
+            failed_plan.as_mut_ptr(),
+            *cuda.cu_stream() as i64,
+        );
+    }
+    assert_eq!(failed_plan[0], -1, "failed native plan must stay invalid");
+    // This ragged geometry previously overflowed the 256 MiB plan region on GPU0.
+    let valid = prefill_plan(
+        &device,
+        &[0, 1, 513],
+        &[0, 1, 17],
+        &[1, 512],
+        513,
+        2,
+        32,
+        2,
+        128,
+        32,
+        DType::BF16,
+        Some(-1),
+        Some(DType::BF16),
+        false,
+    )?;
+    assert!(matches!(valid[0], 0 | 1));
+    device.synchronize()?;
+    Ok(())
+}
