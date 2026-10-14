@@ -1,0 +1,97 @@
+--- a/include/flashinfer/attention/scheduler.cuh
++++ b/include/flashinfer/attention/scheduler.cuh
+@@ -25,11 +25,11 @@
+ #include <sstream>
+ #include <vector>
+ 
+-#include "../allocator.h"
+-#include "../exception.h"
+-#include "../pos_enc.cuh"
+-#include "../utils.cuh"
+-#include "heap.h"
++#include <flashinfer/allocator.h>
++#include <flashinfer/exception.h>
++#include <flashinfer/pos_enc.cuh>
++#include <flashinfer/utils.cuh>
++#include <flashinfer/attention/heap.h>
+ 
+ namespace flashinfer {
+ 
+@@ -374,6 +374,7 @@
+   int64_t kv_chunk_size_ptr_offset;
+   bool enable_cuda_graph;
+   bool split_kv;
++  size_t initialized_integer_bytes;
+ 
+   DecodePlanInfo()
+       : padded_batch_size(0),
+@@ -385,7 +386,8 @@
+         block_valid_mask_offset(0),
+         kv_chunk_size_ptr_offset(0),
+         enable_cuda_graph(false),
+-        split_kv(false) {}
++        split_kv(false),
++        initialized_integer_bytes(0) {}
+ 
+   // convert DecodePlanInfo to std::vector<int64_t>
+   std::vector<int64_t> ToVector() const {
+@@ -485,6 +487,7 @@
+   }
+ 
+   size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
++  plan_info.initialized_integer_bytes = num_bytes_to_copy;
+ 
+   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,
+                                        cudaMemcpyHostToDevice, stream));
+@@ -628,6 +631,7 @@
+   int64_t block_valid_mask_offset;
+   bool enable_cuda_graph;
+   bool split_kv;
++  size_t initialized_integer_bytes;
+ 
+   PrefillPlanInfo()
+       : padded_batch_size(0),
+@@ -644,7 +648,8 @@
+         s_offset(0),
+         block_valid_mask_offset(0),
+         enable_cuda_graph(false),
+-        split_kv(false) {}
++        split_kv(false),
++        initialized_integer_bytes(0) {}
+ 
+   // convert PrefillPlanInfo to std::vector<int64_t>
+   std::vector<int64_t> ToVector() const {
+@@ -790,6 +795,7 @@
+   }
+ 
+   size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
++  plan_info.initialized_integer_bytes = num_bytes_to_copy;
+   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,
+                                        cudaMemcpyHostToDevice, stream));
+ 
+@@ -828,6 +834,7 @@
+   int64_t work_indptr_offset;
+   int64_t batch_indices_offset;
+   bool same_schedule_for_all_heads;
++  size_t initialized_integer_bytes;
+ 
+   PrefillPlanSM90Info()
+       : qo_tile_indices_offset(0),
+@@ -838,7 +845,8 @@
+         head_indices_offset(0),
+         work_indptr_offset(0),
+         batch_indices_offset(0),
+-        same_schedule_for_all_heads(false) {}
++        same_schedule_for_all_heads(false),
++        initialized_integer_bytes(0) {}
+ 
+   // convert PrefillPlanSM90Info to std::vector<int64_t>
+   std::vector<int64_t> ToVector() const {
+@@ -1013,6 +1021,7 @@
+   std::copy(batch_indices_vec.begin(), batch_indices_vec.end(), batch_indices_h);
+ 
+   size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
++  plan_info.initialized_integer_bytes = num_bytes_to_copy;
+   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,
+                                        cudaMemcpyHostToDevice, stream));
+   return cudaSuccess;

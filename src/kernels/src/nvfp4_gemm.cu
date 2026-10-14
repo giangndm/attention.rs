@@ -1258,7 +1258,7 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
 
 #define WMMA_BK 16
 
-template <typename T, int BM, int BN>
+template <typename T, int BM, int BN, bool StableAccumulation = false>
 __global__ void nvfp4_wmma_matmul_kernel(
     const T *__restrict__ input,
     const uint8_t *__restrict__ weight,
@@ -1292,6 +1292,21 @@ __global__ void nvfp4_wmma_matmul_kernel(
     #pragma unroll
     for (int j = 0; j < 2; j++)
       fill_fragment(acc[i][j], 0.0f);
+
+  // Identical local fragment types preserve element correspondence without
+  // assuming a row/column layout. The false specialization drops these owners.
+  fragment<accumulator, 16, 16, 16, float> total[2][2];
+  fragment<accumulator, 16, 16, 16, float> correction[2][2];
+  if constexpr (StableAccumulation) {
+    #pragma unroll
+    for (int fi = 0; fi < 2; fi++) {
+      #pragma unroll
+      for (int fj = 0; fj < 2; fj++) {
+        fill_fragment(total[fi][fj], 0.0f);
+        fill_fragment(correction[fi][fj], 0.0f);
+      }
+    }
+  }
 
   __shared__ T s_a[BM][WMMA_BK + 8];
   __shared__ T s_b[BN][WMMA_BK + 8];
@@ -1375,6 +1390,29 @@ __global__ void nvfp4_wmma_matmul_kernel(
         mma_sync(acc[fi][fj], a_frag, b_frag, acc[fi][fj]);
       }
     }
+    if constexpr (StableAccumulation) {
+      // K is block-uniform; all lanes merge and reset the same partial. Bound
+      // the WMMA chain, then merge with explicit RN compensated F32 arithmetic.
+      if ((k_step + WMMA_BK) % 64 == 0 || k_step + WMMA_BK >= K) {
+        #pragma unroll
+        for (int fi = 0; fi < 2; fi++) {
+          #pragma unroll
+          for (int fj = 0; fj < 2; fj++) {
+            #pragma unroll
+            for (int e = 0; e < acc[fi][fj].num_elements; e++) {
+              const float old_total = total[fi][fj].x[e];
+              const float adjusted = __fsub_rn(acc[fi][fj].x[e], correction[fi][fj].x[e]);
+              const float next_total = __fadd_rn(old_total, adjusted);
+              correction[fi][fj].x[e] = isfinite(next_total)
+                  ? __fsub_rn(__fsub_rn(next_total, old_total), adjusted)
+                  : 0.0f;
+              total[fi][fj].x[e] = next_total;
+            }
+            fill_fragment(acc[fi][fj], 0.0f);
+          }
+        }
+      }
+    }
     __syncthreads();
   }
 
@@ -1385,8 +1423,12 @@ __global__ void nvfp4_wmma_matmul_kernel(
   for (int fi = 0; fi < 2; fi++)
     #pragma unroll
     for (int fj = 0; fj < 2; fj++)
-      store_matrix_sync(&s_out[warp_row + fi * 16][warp_col + fj * 16],
-                        acc[fi][fj], BN + 4, mem_row_major);
+      if constexpr (StableAccumulation)
+        store_matrix_sync(&s_out[warp_row + fi * 16][warp_col + fj * 16],
+                          total[fi][fj], BN + 4, mem_row_major);
+      else
+        store_matrix_sync(&s_out[warp_row + fi * 16][warp_col + fj * 16],
+                          acc[fi][fj], BN + 4, mem_row_major);
   __syncthreads();
 
   for (int i = tid; i < BM * BN; i += 128) {
@@ -1693,10 +1735,17 @@ extern "C" void nvfp4_matmul_bf16(const __nv_bfloat16 *input,
   constexpr int BM = 64, BN = 64;
   dim3 block(128);
   dim3 grid(CEILDIV(N, BN), CEILDIV(M, BM));
-  nvfp4_gemm::nvfp4_wmma_matmul_kernel<__nv_bfloat16, BM, BN>
-      <<<grid, block, 0, stream>>>(input, weight, weight_scale,
-                                   weight_global_scale, bias, output, M, N, K,
-                                   has_bias, force_lut);
+  if (force_lut) {
+    nvfp4_gemm::nvfp4_wmma_matmul_kernel<__nv_bfloat16, BM, BN, true>
+        <<<grid, block, 0, stream>>>(input, weight, weight_scale,
+                                     weight_global_scale, bias, output, M, N, K,
+                                     has_bias, force_lut);
+  } else {
+    nvfp4_gemm::nvfp4_wmma_matmul_kernel<__nv_bfloat16, BM, BN>
+        <<<grid, block, 0, stream>>>(input, weight, weight_scale,
+                                     weight_global_scale, bias, output, M, N, K,
+                                     has_bias, force_lut);
+  }
 }
 #else
 extern "C" void nvfp4_matmul_bf16(const void *, const uint8_t *,

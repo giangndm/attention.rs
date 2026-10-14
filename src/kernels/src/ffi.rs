@@ -1280,6 +1280,7 @@ extern "C" {
         data_type: i32,
         out_data_type: i32,
         plan_info_out: *mut i64, // length 10
+        initialized_bytes_out: *mut usize,
         stream: i64,
     );
 
@@ -1303,6 +1304,7 @@ extern "C" {
         data_type: i32,
         out_data_type: i32,
         plan_info_out: *mut i64, // length 9
+        initialized_bytes_out: *mut usize,
         stream: i64,
     );
 
@@ -1383,6 +1385,7 @@ extern "C" {
         page_locked_buffer: *mut c_void,
         page_locked_size: usize,
         plan_info_out: *mut i64,
+        initialized_bytes_out: *mut usize,
         stream: i64,
     );
 
@@ -1438,6 +1441,7 @@ extern "C" {
         page_locked_buffer: *mut c_void,
         page_locked_size: usize,
         plan_info_out: *mut i64,
+        initialized_bytes_out: *mut usize,
         stream: i64,
     );
 

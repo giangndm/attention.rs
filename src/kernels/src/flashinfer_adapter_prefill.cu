@@ -1,4 +1,5 @@
 #include "flashinfer_common.cuh"
+#include <exception>
 
 #if defined(FLASHINFER_ENABLE_FP8_E4M3)
 extern "C" {
@@ -270,66 +271,96 @@ void flashinfer_prefill_plan_wrapper(
     void* workspace_int, size_t workspace_int_size,
     void* page_locked_buffer, size_t page_locked_size,
     int64_t* plan_info_out,
+    size_t* initialized_bytes_out,
     cudaStream_t stream)
 {
+    if (initialized_bytes_out != nullptr) *initialized_bytes_out = 0;
+    if (plan_info_out == nullptr) {
+        fprintf(stderr, "[flashinfer][prefill_plan] output pointer is null\n");
+        return;
+    }
+    // The void C ABI communicates failure through the existing invalid plan tag.
+    plan_info_out[0] = -1;
 #ifdef USE_FLASHINFER
-    if (page_locked_buffer == nullptr || page_locked_size < workspace_int_size) {
-        fprintf(stderr, "[flashinfer][prefill_plan] page_locked_buffer too small\n");
-        return;
-    }
-    if (q_cu_seqlens_host == nullptr || indptr_host == nullptr || kv_len_arr_host == nullptr) {
-        fprintf(stderr, "[flashinfer][prefill_plan] host pointers are null\n");
-        return;
-    }
-
-#if defined(SM_90_PASS)
-    {
-        PrefillPlanSM90Info plan_info;
-        PrefillSM90Plan<int32_t>(
-            workspace_float, workspace_float_size,
-            workspace_int, page_locked_buffer, workspace_int_size,
-            plan_info,
-            q_cu_seqlens_host, indptr_host, kv_len_arr_host,
-            total_num_rows, batch_size,
-            num_qo_heads, num_kv_heads, head_dim, head_dim, page_size,
-            true, enable_cuda_graph,
-            (out_data_type == 1 ? sizeof(nv_bfloat16) : sizeof(half)),
-            stream
-        );
-        if (plan_info_out != nullptr) {
-            plan_info_out[0] = 1; // tag: SM90
-            auto vec = plan_info.ToVector();
-            for (int i = 0; i < 9; ++i) {
-                plan_info_out[1 + i] = vec[i];
-            }
-        }
-    }
-#else
-    {
-        PrefillPlanInfo plan_info;
-        PrefillPlan<int32_t>(
-            workspace_float, workspace_float_size,
-            workspace_int, page_locked_buffer, workspace_int_size,
-            plan_info,
-            q_cu_seqlens_host, indptr_host, total_num_rows,
-            batch_size, num_qo_heads, num_kv_heads, head_dim, head_dim, page_size,
-            enable_cuda_graph, (out_data_type == 1 ? sizeof(nv_bfloat16) : sizeof(half)),
-            window_left > 0 ? window_left : -1, 0, false, 0,
-            stream
-        );
-        if (!ValidatePrefillPlanInfoBounds(
-                plan_info, workspace_float_size, workspace_int_size)) {
+    try {
+        if (page_locked_buffer == nullptr || page_locked_size < workspace_int_size) {
+            fprintf(stderr, "[flashinfer][prefill_plan] page_locked_buffer too small\n");
             return;
         }
-        if (plan_info_out != nullptr) {
-            plan_info_out[0] = 0; // tag: non-SM90
-            auto vec = plan_info.ToVector();
-            for (int i = 0; i < 15; ++i) {
-                plan_info_out[1 + i] = vec[i];
+        if (q_cu_seqlens_host == nullptr || indptr_host == nullptr || kv_len_arr_host == nullptr) {
+            fprintf(stderr, "[flashinfer][prefill_plan] host pointers are null\n");
+            return;
+        }
+
+#if defined(SM_90_PASS)
+        {
+            PrefillPlanSM90Info plan_info;
+            cudaError_t status = PrefillSM90Plan<int32_t>(
+                workspace_float, workspace_float_size,
+                workspace_int, page_locked_buffer, workspace_int_size,
+                plan_info,
+                q_cu_seqlens_host, indptr_host, kv_len_arr_host,
+                total_num_rows, batch_size,
+                num_qo_heads, num_kv_heads, head_dim, head_dim, page_size,
+                true, enable_cuda_graph,
+                (out_data_type == 1 ? sizeof(nv_bfloat16) : sizeof(half)),
+                stream
+            );
+            if (status != cudaSuccess) {
+                fprintf(stderr, "[flashinfer][prefill_plan] CUDA planning failed: %s\n", cudaGetErrorString(status));
+                return;
+            }
+            {
+                auto vec = plan_info.ToVector();
+                for (int i = 0; i < 9; ++i) {
+                    plan_info_out[1 + i] = vec[i];
+                }
+                if (initialized_bytes_out != nullptr) {
+                    *initialized_bytes_out = plan_info.initialized_integer_bytes;
+                }
+                plan_info_out[0] = 1; // Publish only after conversion and copies succeed.
             }
         }
-    }
+#else
+        {
+            PrefillPlanInfo plan_info;
+            cudaError_t status = PrefillPlan<int32_t>(
+                workspace_float, workspace_float_size,
+                workspace_int, page_locked_buffer, workspace_int_size,
+                plan_info,
+                q_cu_seqlens_host, indptr_host, total_num_rows,
+                batch_size, num_qo_heads, num_kv_heads, head_dim, head_dim, page_size,
+                enable_cuda_graph, (out_data_type == 1 ? sizeof(nv_bfloat16) : sizeof(half)),
+                window_left > 0 ? window_left : -1, 0, false, 0,
+                stream
+            );
+            if (status != cudaSuccess) {
+                fprintf(stderr, "[flashinfer][prefill_plan] CUDA planning failed: %s\n", cudaGetErrorString(status));
+                return;
+            }
+            if (!ValidatePrefillPlanInfoBounds(
+                    plan_info, workspace_float_size, workspace_int_size)) {
+                return;
+            }
+            {
+                auto vec = plan_info.ToVector();
+                for (int i = 0; i < 15; ++i) {
+                    plan_info_out[1 + i] = vec[i];
+                }
+                if (initialized_bytes_out != nullptr) {
+                    *initialized_bytes_out = plan_info.initialized_integer_bytes;
+                }
+                plan_info_out[0] = 0; // Publish only after conversion and copies succeed.
+            }
+        }
 #endif
+    } catch (const std::exception& error) {
+        plan_info_out[0] = -1;
+        fprintf(stderr, "[flashinfer][prefill_plan] planning failed: %.1024s\n", error.what());
+    } catch (...) {
+        plan_info_out[0] = -1;
+        fprintf(stderr, "[flashinfer][prefill_plan] planning failed: unknown exception\n");
+    }
 #endif
 }
 

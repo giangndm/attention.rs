@@ -379,9 +379,15 @@ void flashinfer_decode_plan_wrapper_fp8(
     int32_t data_type,
     int32_t out_data_type,
     int64_t* plan_info_out,
+    size_t* initialized_bytes_out,
     cudaStream_t stream
 ) {
+    if (plan_info_out != nullptr) {
+        for (int i = 0; i < 9; ++i) plan_info_out[i] = 0;
+    }
+    if (initialized_bytes_out != nullptr) *initialized_bytes_out = 0;
 #if defined(USE_FLASHINFER) && defined(FLASHINFER_ENABLE_FP8_E4M3)
+    try {
     if (data_type != 2) {
         return;
     }
@@ -392,7 +398,7 @@ void flashinfer_decode_plan_wrapper_fp8(
         return;
     }
     PrefillPlanSM90Info plan_info;
-    PrefillSM90Plan<int32_t>(
+    cudaError_t status = PrefillSM90Plan<int32_t>(
         workspace_float, workspace_float_size,
         workspace_int, page_locked_int_buffer, workspace_int_size,
         plan_info,
@@ -403,6 +409,10 @@ void flashinfer_decode_plan_wrapper_fp8(
         2,
         stream
     );
+    if (status != cudaSuccess) {
+        fprintf(stderr, "[flashinfer][decode_plan_fp8] CUDA planning failed: %s\n", cudaGetErrorString(status));
+        return;
+    }
     if (plan_info_out != nullptr) {
         plan_info_out[0] = plan_info.qo_tile_indices_offset;
         plan_info_out[1] = plan_info.qo_indptr_offset;
@@ -413,6 +423,16 @@ void flashinfer_decode_plan_wrapper_fp8(
         plan_info_out[6] = plan_info.work_indptr_offset;
         plan_info_out[7] = plan_info.batch_indices_offset;
         plan_info_out[8] = plan_info.same_schedule_for_all_heads;
+    }
+    if (initialized_bytes_out != nullptr) {
+        *initialized_bytes_out = plan_info.initialized_integer_bytes;
+    }
+    } catch (const std::exception& error) {
+        if (initialized_bytes_out != nullptr) *initialized_bytes_out = 0;
+        fprintf(stderr, "[flashinfer][decode_plan_fp8] planning failed: %.1024s\n", error.what());
+    } catch (...) {
+        if (initialized_bytes_out != nullptr) *initialized_bytes_out = 0;
+        fprintf(stderr, "[flashinfer][decode_plan_fp8] planning failed: unknown exception\n");
     }
 #endif
 }

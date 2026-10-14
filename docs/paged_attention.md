@@ -83,3 +83,28 @@ impl Attention {
 ## Backend Implementation
 - **CUDA**: `paged_attention_v2.cu` uses a thread-block level reduction to handle variable-length context efficiently.
 - **Metal**: `pagedattention.metal` provides a high-performance implementation for Apple Silicon, optimized for SIMD-group reductions.
+
+
+## FlashInfer plan workspace and failures
+
+The existing thread/device workspace reserves a 384 MiB plan float region and
+separate 256 MiB GEMM scratch region (640 MiB total), plus 128 MiB device integer
+and pinned-host buffers. The plan capacity covers Muse Q32/KV2/D128 non-graph
+split plans on a 170-SM GPU: at most 170 split tiles of 128 query rows require
+342.65625 MiB for temporary V/S. This is a bounded geometry/device guarantee,
+not an unlimited capacity promise. It adds 128 MiB per initialized float
+workspace; graph workspaces are allocated separately when requested.
+
+The separated BF16/F16 prefill planner keeps its void C ABI and existing plan
+vector. It invalidates the tag before planning, contains native exceptions,
+checks CUDA planning status, and publishes the success tag only after the full
+plan is copied. Rust validates the tag and returns an error before attention
+writes; no retry or backend fallback occurs. GEMM scratch never aliases the plan.
+
+Run the allocator-containment and ragged 1/512 query regression on GPU0:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 RUSTFLAGS="-l stdc++" cargo test --features cuda,flash,cutlass,flashinfer \
+  --test flashinfer_append_prefill flashinfer_prefill_plan_contains_workspace_exception \
+  -- --ignored --test-threads=1 --nocapture
+```

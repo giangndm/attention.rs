@@ -239,7 +239,7 @@ flash_prefill_paged(
         unsigned int kv_start = kv_block * BC;
         unsigned int kv_end = min(kv_start + BC, kv_len);
         unsigned int kv_tile_len = kv_end - kv_start;
-        unsigned int buf = kv_block & 1;
+        unsigned int buf = (kv_block - kv_block_start) & 1;
 
         // Async V load (overlaps with QK^T)
         LOAD_KV_TILE_BF16(V_cache, block_table, smem_V, kv_start, kv_len, kv_head, tid, NUM_THREADS);
@@ -395,7 +395,7 @@ flash_prefill_paged(
 
         // Preload K[i+2] into the next-next buffer (overlaps with PV compute)
         if (kv_block + 2 < num_kv_blocks) {
-            LOAD_KV_TILE_BF16(K_cache, block_table, (&SMEM_K_PAGED(kv_block & 1, 0)),
+            LOAD_KV_TILE_BF16(K_cache, block_table, (&SMEM_K_PAGED(buf, 0)),
                 (kv_block + 2) * BC, kv_len, kv_head, tid, NUM_THREADS);
             FLASH_ASYNC_COMMIT();
         }

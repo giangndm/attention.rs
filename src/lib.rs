@@ -7,6 +7,7 @@ compile_error!("Enable exactly one backend feature: `cuda` or `metal`.");
 #[cfg(all(feature = "flashinfer", feature = "flashattn"))]
 compile_error!("Features `flashinfer` and `flashattn` are mutually exclusive. Enable only one.");
 
+pub mod flashinfer;
 pub mod moe;
 pub mod paged_attention;
 pub mod scale_update;
@@ -116,7 +117,7 @@ fn metal_flash_cast_contiguous(t: &Tensor, dtype: DType) -> Result<Tensor> {
 }
 
 #[cfg(feature = "flashinfer")]
-pub mod flashinfer;
+mod flashinfer_ops;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurboquantMode {
@@ -224,8 +225,8 @@ pub struct FlashInferMetadata {
     pub batch_indices: Option<Tensor>,
     pub positions: Option<Tensor>,
     pub use_cuda_graph: bool,
-    pub decode_plan_info: Option<Arc<Vec<i64>>>,
-    pub prefill_plan_info: Option<Arc<Vec<i64>>>,
+    pub decode_plan_info: Option<Arc<crate::flashinfer::DecodePlan>>,
+    pub prefill_plan_info: Option<Arc<crate::flashinfer::PrefillPlan>>,
     pub mla_decode_plan_info: Option<Arc<Vec<i64>>>,
     pub mla_prefill_plan_info: Option<Arc<Vec<i64>>>,
 }
@@ -869,7 +870,7 @@ impl PagedAttention {
                             self.scale as f32,
                             Some(flashinfer_run_window_left(fm.window_left)),
                             Some(softcapping.unwrap_or(0.0f64) as f32),
-                            plan_info,
+                            plan_info.clone(),
                             fm.use_cuda_graph,
                         );
                     } else {
