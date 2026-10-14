@@ -1,7 +1,10 @@
 #![cfg(all(feature = "cuda", feature = "flash", feature = "flashinfer"))]
 
-use attention_rs::{flashinfer::prefill_plan, FlashInferMetadata, InputMetadata, PagedAttention};
-use candle_core::{DType, Device, Result, Tensor};
+use attention_rs::{
+    flashinfer::{prefill_plan, prefill_with_plan},
+    FlashInferMetadata, InputMetadata, PagedAttention,
+};
+use candle_core::{cuda_backend::CudaDevice, DType, Device, Result, Tensor};
 use half::bf16;
 use std::sync::Arc;
 
@@ -13,12 +16,11 @@ const QUERY_LEN: usize = 3;
 const WINDOW_LEFT: i32 = -1;
 
 #[test]
-fn flashinfer_metadata_clones_share_host_vectors_and_plans() -> Result<()> {
+fn flashinfer_metadata_clones_share_host_vectors() -> Result<()> {
     let device = Device::Cpu;
     let indptr_host = Arc::new(vec![0_u32, 1]);
     let last_len_host = Arc::new(vec![1_u32]);
     let kv_len_arr_host = Arc::new(vec![1_u32]);
-    let decode_plan_info = Arc::new(vec![0_i64; 10]);
     let metadata = FlashInferMetadata {
         indptr: Tensor::zeros(2, DType::U32, &device)?,
         indptr_host: indptr_host.clone(),
@@ -31,7 +33,7 @@ fn flashinfer_metadata_clones_share_host_vectors_and_plans() -> Result<()> {
         batch_indices: None,
         positions: None,
         use_cuda_graph: false,
-        decode_plan_info: Some(decode_plan_info.clone()),
+        decode_plan_info: None,
         prefill_plan_info: None,
         mla_decode_plan_info: None,
         mla_prefill_plan_info: None,
@@ -51,25 +53,18 @@ fn flashinfer_metadata_clones_share_host_vectors_and_plans() -> Result<()> {
                     .as_ref()
                     .expect("fixture has KV lengths")
                     .clone(),
-                metadata
-                    .decode_plan_info
-                    .as_ref()
-                    .expect("fixture has decode plan")
-                    .clone(),
             )
         })
         .collect::<Vec<_>>();
 
-    for (indptr, last_len, kv_len, plan) in &clones {
+    for (indptr, last_len, kv_len) in &clones {
         assert!(Arc::ptr_eq(indptr, &indptr_host));
         assert!(Arc::ptr_eq(last_len, &last_len_host));
         assert!(Arc::ptr_eq(kv_len, &kv_len_arr_host));
-        assert!(Arc::ptr_eq(plan, &decode_plan_info));
     }
     assert_eq!(Arc::strong_count(&indptr_host), 66);
     assert_eq!(Arc::strong_count(&last_len_host), 66);
     assert_eq!(Arc::strong_count(&kv_len_arr_host), 66);
-    assert_eq!(Arc::strong_count(&decode_plan_info), 66);
     Ok(())
 }
 
@@ -125,7 +120,7 @@ fn metadata(
             positions: None,
             use_cuda_graph: false,
             decode_plan_info: None,
-            prefill_plan_info: Some(Arc::new(prefill_plan(
+            prefill_plan_info: Some(prefill_plan(
                 device,
                 &qo_indptr_host,
                 &indptr_host,
@@ -140,7 +135,7 @@ fn metadata(
                 Some(WINDOW_LEFT),
                 Some(DType::U8),
                 false,
-            )?)),
+            )?),
             mla_decode_plan_info: None,
             mla_prefill_plan_info: None,
         })
@@ -356,6 +351,66 @@ fn flashinfer_multi_chunk_matches_one_shot_cache_and_output() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn flashinfer_plan_reuses_bounded_workspace_without_changing_legacy_owners() -> Result<()> {
+    assert_eq!(std::env::var("CUDA_VISIBLE_DEVICES").as_deref(), Ok("0"));
+    let first = Device::Cuda(CudaDevice::new_with_stream(0)?);
+    let second = Device::Cuda(CudaDevice::new_with_stream(0)?);
+    let third = Device::Cuda(CudaDevice::new_with_stream(0)?);
+    let first_cuda = first.as_cuda_device()?;
+    let third_cuda = third.as_cuda_device()?;
+
+    let legacy_normal = attention_rs::workspace::get_plan_workspace(first_cuda, false)?.0 as usize;
+    let legacy_graph = attention_rs::workspace::get_plan_workspace(first_cuda, true)?.0 as usize;
+    for device in [&first, &second] {
+        drop(prefill_plan(
+            device,
+            &[0, 1],
+            &[0, 1],
+            &[1],
+            1,
+            1,
+            HEADS,
+            HEADS,
+            HEAD_DIM,
+            PAGE_SIZE,
+            DType::BF16,
+            Some(-1),
+            Some(DType::BF16),
+            false,
+        )?);
+    }
+    drop(prefill_plan(
+        &third,
+        &[0, 1],
+        &[0, 1],
+        &[1],
+        1,
+        1,
+        HEADS,
+        HEADS,
+        HEAD_DIM,
+        PAGE_SIZE,
+        DType::BF16,
+        Some(-1),
+        Some(DType::BF16),
+        false,
+    )?);
+
+    assert_eq!(
+        attention_rs::workspace::get_plan_workspace(third_cuda, false)?.0 as usize,
+        legacy_normal
+    );
+    assert_eq!(
+        attention_rs::workspace::get_plan_workspace(third_cuda, true)?.0 as usize,
+        legacy_graph
+    );
+    first.synchronize()?;
+    second.synchronize()?;
+    third.synchronize()?;
+    Ok(())
+}
+
 /// An allocator failure must remain inside the C ABI, then a mixed plan must work.
 #[test]
 #[ignore = "requires GPU0 with FlashInfer"]
@@ -370,6 +425,7 @@ fn flashinfer_prefill_plan_contains_workspace_exception() -> Result<()> {
     let lengths = [1_i32];
     // Start with an apparently valid tag: the wrapper must invalidate it itself.
     let mut failed_plan = [0_i64; 16];
+    let mut failed_extent = usize::MAX;
     // SAFETY: All pointers reference live allocations/arrays. Advertising one byte
     // of int capacity forces the first allocator check before host writes/copies.
     unsafe {
@@ -393,10 +449,15 @@ fn flashinfer_prefill_plan_contains_workspace_exception() -> Result<()> {
             host_ptr,
             host_size,
             failed_plan.as_mut_ptr(),
+            &mut failed_extent,
             *cuda.cu_stream() as i64,
         );
     }
     assert_eq!(failed_plan[0], -1, "failed native plan must stay invalid");
+    assert_eq!(
+        failed_extent, 0,
+        "failed native plan must report an empty extent"
+    );
     // This ragged geometry previously overflowed the 256 MiB plan region on GPU0.
     let valid = prefill_plan(
         &device,
@@ -414,7 +475,194 @@ fn flashinfer_prefill_plan_contains_workspace_exception() -> Result<()> {
         Some(DType::BF16),
         false,
     )?;
-    assert!(matches!(valid[0], 0 | 1));
+    drop(valid);
+    device.synchronize()?;
+    Ok(())
+}
+
+/// Dense plan construction synchronizes and allocates, so it must reject an
+/// active capture. The graph owner keeps a prepared plan alive through replay.
+#[cfg(feature = "graph")]
+#[test]
+fn flashinfer_plan_rejects_capture_and_caller_retains_plan_through_graph_replay() -> Result<()> {
+    use candle_core::cuda_backend::cudarc::driver::sys;
+
+    assert_eq!(std::env::var("CUDA_VISIBLE_DEVICES").as_deref(), Ok("0"));
+    let device = Device::Cuda(CudaDevice::new_with_stream(0)?);
+    let cuda = device.as_cuda_device()?;
+    let retained_plan = prefill_plan(
+        &device,
+        &[0, 1],
+        &[0, 1],
+        &[1],
+        1,
+        1,
+        1,
+        1,
+        128,
+        32,
+        DType::BF16,
+        Some(-1),
+        Some(DType::BF16),
+        true,
+    )?;
+
+    let q = Tensor::from_vec(
+        (0..HEAD_DIM)
+            .map(|index| bf16::from_f32((index as f32 + 1.0) / HEAD_DIM as f32))
+            .collect::<Vec<_>>(),
+        (1, 1, HEAD_DIM),
+        &device,
+    )?;
+    let key_cache = Tensor::zeros((BLOCKS, PAGE_SIZE, HEADS, HEAD_DIM), DType::BF16, &device)?;
+    let value_cache = Tensor::zeros((BLOCKS, PAGE_SIZE, HEADS, HEAD_DIM), DType::BF16, &device)?;
+    let indices = Tensor::from_vec(vec![0_u32], 1, &device)?;
+    let indptr = Tensor::from_vec(vec![0_u32, 1], 2, &device)?;
+    let last_len = Tensor::from_vec(vec![1_u32], 1, &device)?;
+    let q_cu_seqlens = Tensor::from_vec(vec![0_u32, 1], 2, &device)?;
+    let stream = *cuda.cu_stream();
+    let driver = unsafe { sys::lib() };
+    let begin = unsafe {
+        driver.cuStreamBeginCapture_v2(
+            stream,
+            sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )
+    };
+    assert_eq!(begin, sys::CUresult::CUDA_SUCCESS);
+    let output = prefill_with_plan(
+        &q,
+        &key_cache,
+        &value_cache,
+        None,
+        None,
+        &indices,
+        &indptr,
+        &last_len,
+        &q_cu_seqlens,
+        1,
+        PAGE_SIZE,
+        HEADS,
+        HEADS,
+        HEAD_DIM,
+        1.0 / (HEAD_DIM as f32).sqrt(),
+        Some(-1),
+        None,
+        retained_plan.clone(),
+        true,
+    )?;
+
+    let captured_plan_result = prefill_plan(
+        &device,
+        &[0, 1],
+        &[0, 1],
+        &[1],
+        1,
+        1,
+        1,
+        1,
+        128,
+        32,
+        DType::BF16,
+        Some(-1),
+        Some(DType::BF16),
+        false,
+    );
+    assert!(captured_plan_result.is_err());
+
+    let mut graph = std::ptr::null_mut();
+    let end = unsafe { driver.cuStreamEndCapture(stream, &mut graph) };
+    assert_eq!(end, sys::CUresult::CUDA_SUCCESS);
+    assert!(!graph.is_null());
+    let mut node_count = 0;
+    assert_eq!(
+        unsafe { driver.cuGraphGetNodes(graph, std::ptr::null_mut(), &mut node_count) },
+        sys::CUresult::CUDA_SUCCESS
+    );
+    assert!(
+        node_count > 0,
+        "the graph must contain the plan-backed operation"
+    );
+    let mut graph_nodes = vec![std::ptr::null_mut(); node_count];
+    assert_eq!(
+        unsafe { driver.cuGraphGetNodes(graph, graph_nodes.as_mut_ptr(), &mut node_count) },
+        sys::CUresult::CUDA_SUCCESS
+    );
+    let mut has_kernel_node = false;
+    let mut has_alloc_node = false;
+    for node in graph_nodes {
+        let mut node_type = std::mem::MaybeUninit::uninit();
+        assert_eq!(
+            unsafe { driver.cuGraphNodeGetType(node, node_type.as_mut_ptr()) },
+            sys::CUresult::CUDA_SUCCESS
+        );
+        match unsafe { node_type.assume_init() } {
+            sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL => has_kernel_node = true,
+            sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_ALLOC => has_alloc_node = true,
+            _ => {}
+        }
+    }
+    assert!(
+        has_kernel_node,
+        "capture must contain the FlashInfer kernel"
+    );
+    assert!(
+        has_alloc_node,
+        "capture must retain Candle's output allocation"
+    );
+
+    let mut graph_exec = std::ptr::null_mut();
+    let instantiate = unsafe {
+        driver.cuGraphInstantiateWithFlags(
+            &mut graph_exec,
+            graph,
+            sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH
+                as u64,
+        )
+    };
+    assert_eq!(instantiate, sys::CUresult::CUDA_SUCCESS);
+    assert!(!graph_exec.is_null());
+    let upload = unsafe { driver.cuGraphUpload(graph_exec, stream) };
+    assert_eq!(upload, sys::CUresult::CUDA_SUCCESS);
+    device.synchronize()?;
+    for _ in 0..3 {
+        let replay = unsafe { driver.cuGraphLaunch(graph_exec, stream) };
+        assert_eq!(replay, sys::CUresult::CUDA_SUCCESS);
+    }
+    device.synchronize()?;
+    assert_eq!(
+        unsafe { driver.cuGraphExecDestroy(graph_exec) },
+        sys::CUresult::CUDA_SUCCESS
+    );
+    assert_eq!(
+        unsafe { driver.cuGraphDestroy(graph) },
+        sys::CUresult::CUDA_SUCCESS
+    );
+    device.synchronize()?;
+    let output_values = output
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    assert!(output_values.iter().all(|value| value.is_finite()));
+    drop(output);
+    drop(retained_plan);
+    device.synchronize()?;
+    let replacement = prefill_plan(
+        &device,
+        &[0, 1],
+        &[0, 1],
+        &[1],
+        1,
+        1,
+        HEADS,
+        HEADS,
+        HEAD_DIM,
+        PAGE_SIZE,
+        DType::BF16,
+        Some(-1),
+        Some(DType::BF16),
+        false,
+    )?;
+    drop(replacement);
     device.synchronize()?;
     Ok(())
 }

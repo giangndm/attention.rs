@@ -150,9 +150,15 @@ void flashinfer_decode_plan_wrapper(
     int32_t data_type,
     int32_t out_data_type,
     int64_t* plan_info_out,
+    size_t* initialized_bytes_out,
     cudaStream_t stream
 ) {
+    if (plan_info_out != nullptr) {
+        for (int i = 0; i < 10; ++i) plan_info_out[i] = 0;
+    }
+    if (initialized_bytes_out != nullptr) *initialized_bytes_out = 0;
 #ifdef USE_FLASHINFER
+    try {
     if (num_kv_heads <= 0 || num_qo_heads <= 0 || (num_qo_heads % num_kv_heads) != 0) {
         fprintf(stderr,
                 "[flashinfer][decode_plan] invalid head config qo_heads=%d kv_heads=%d\n",
@@ -211,6 +217,9 @@ void flashinfer_decode_plan_wrapper(
                         plan_info_out[8] = plan_info.enable_cuda_graph;
                         plan_info_out[9] = plan_info.split_kv;
                     }
+                    if (initialized_bytes_out != nullptr) {
+                        *initialized_bytes_out = plan_info.initialized_integer_bytes;
+                    }
                 });
             });
         };
@@ -257,6 +266,9 @@ void flashinfer_decode_plan_wrapper(
                     plan_info_out[8] = plan_info.enable_cuda_graph;
                     plan_info_out[9] = plan_info.split_kv;
                 }
+                if (initialized_bytes_out != nullptr) {
+                    *initialized_bytes_out = plan_info.initialized_integer_bytes;
+                }
             });
         });
     };
@@ -265,6 +277,13 @@ void flashinfer_decode_plan_wrapper(
         run_plan(nv_bfloat16{});
     } else {
         run_plan(half{});
+    }
+    } catch (const std::exception& error) {
+        if (initialized_bytes_out != nullptr) *initialized_bytes_out = 0;
+        fprintf(stderr, "[flashinfer][decode_plan] planning failed: %.1024s\n", error.what());
+    } catch (...) {
+        if (initialized_bytes_out != nullptr) *initialized_bytes_out = 0;
+        fprintf(stderr, "[flashinfer][decode_plan] planning failed: unknown exception\n");
     }
 #endif
 }

@@ -87,6 +87,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/flash/flash_prefill_tq3.cuh");
     println!("cargo:rerun-if-changed=src/flash/flash_sm_compat.cuh");
     println!("cargo:rerun-if-changed=patches/flashinfer-fp8-paged-repack.patch");
+    println!("cargo:rerun-if-changed=patches/flashinfer-owned-scheduler.patch");
 
     let marlin_disabled = std::env::var("CARGO_FEATURE_NO_MARLIN").is_ok();
     let fp8_kvcache_disabled = std::env::var("CARGO_FEATURE_NO_FP8_KVCACHE").is_ok();
@@ -269,14 +270,19 @@ fn main() -> Result<()> {
         );
 
         let flashinfer_root = builder.fetch_git_dependency("flashinfer")?;
-        let flashinfer_overlay = prepare_flashinfer_prefill_overlay(&flashinfer_root, &build_dir)?;
-        let applied_overlay = flashinfer_overlay.join("include/flashinfer/attention/prefill.cuh");
+        let flashinfer_overlay = prepare_flashinfer_overlay(&flashinfer_root, &build_dir)?;
+        let applied_scheduler =
+            flashinfer_overlay.join("include/flashinfer/attention/scheduler.cuh");
+        let applied_prefill = flashinfer_overlay.join("include/flashinfer/attention/prefill.cuh");
         let overlay_fingerprint_arg =
-            flashinfer_overlay_fingerprint::cuda_object_fingerprint_arg(&applied_overlay)
-                .context("failed to fingerprint applied FlashInfer prefill overlay")?;
+            flashinfer_overlay_fingerprint::cuda_object_fingerprint_arg(&[
+                &applied_scheduler,
+                &applied_prefill,
+            ])
+            .context("failed to fingerprint applied FlashInfer scheduler and prefill overlays")?;
         builder = builder
             .arg(&overlay_fingerprint_arg)
-            .watch([applied_overlay]);
+            .watch([applied_scheduler, applied_prefill]);
         builder = builder.include_path(flashinfer_overlay.join("include"));
         let csrc_dir = flashinfer_root.join("csrc");
         let trtllm_dir = csrc_dir.join("nv_internal").join("tensorrt_llm");
@@ -466,6 +472,20 @@ fn main() -> Result<()> {
         println!("cargo:rustc-link-lib=nativeflash");
     }
     println!("cargo:rustc-link-lib=pagedattention");
+    if flashinfer_enabled {
+        let target = std::env::var("TARGET").context("TARGET is required")?;
+        if target.contains("-linux-") {
+            // FlashInfer's static archive contains C++ objects. Emit the host
+            // runtime after the archives so their std::* references resolve.
+            println!("cargo:rustc-link-lib=dylib=stdc++");
+        } else if target.contains("-apple-") {
+            println!("cargo:rustc-link-lib=dylib=c++");
+        } else if !target.ends_with("-msvc") {
+            bail!("FlashInfer C++ runtime linking is unsupported for target {target}");
+        }
+        // MSVC links the C++ runtime through directives emitted by the host
+        // compiler, so it does not need an explicit library here.
+    }
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=cublas");
 
@@ -484,66 +504,82 @@ fn build_archive(builder: &KernelBuilder, archive: &Path) -> Result<()> {
     Ok(())
 }
 
-fn prepare_flashinfer_prefill_overlay(flashinfer_root: &Path, build_dir: &Path) -> Result<PathBuf> {
-    let patch =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("patches/flashinfer-fp8-paged-repack.patch");
-    let source = flashinfer_root.join("include/flashinfer/attention/prefill.cuh");
+fn prepare_flashinfer_overlay(flashinfer_root: &Path, build_dir: &Path) -> Result<PathBuf> {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let overlay = build_dir.join("flashinfer-prefill-overlay");
-    let destination = overlay.join("include/flashinfer/attention/prefill.cuh");
     let stamp = overlay.join(".fingerprint");
+    let scheduler_rel = Path::new("include/flashinfer/attention/scheduler.cuh");
+    let prefill_rel = Path::new("include/flashinfer/attention/prefill.cuh");
+    let scheduler_patch = manifest.join("patches/flashinfer-owned-scheduler.patch");
+    let prefill_patch = manifest.join("patches/flashinfer-fp8-paged-repack.patch");
     let inputs = format!(
-        "{:x}{:x}",
-        Sha256::digest(fs::read(&source)?),
-        Sha256::digest(fs::read(&patch)?)
+        "{:x}{:x}{:x}{:x}",
+        Sha256::digest(fs::read(flashinfer_root.join(scheduler_rel))?),
+        Sha256::digest(fs::read(flashinfer_root.join(prefill_rel))?),
+        Sha256::digest(fs::read(&scheduler_patch)?),
+        Sha256::digest(fs::read(&prefill_patch)?)
     );
-    // Reuse the applied header without rewriting its mtime on each Cargo build.
-    // Source/patch changes or a missing/corrupt overlay recreate it under the lock.
-    if destination.is_file() {
-        let expected = format!("{inputs}\n{:x}", Sha256::digest(fs::read(&destination)?));
-        if fs::read_to_string(&stamp).ok().as_deref() == Some(expected.as_str()) {
+    let applied_scheduler = overlay.join(scheduler_rel);
+    let applied_prefill = overlay.join(prefill_rel);
+    if applied_scheduler.is_file() && applied_prefill.is_file() {
+        let applied = format!(
+            "{:x}{:x}",
+            Sha256::digest(fs::read(&applied_scheduler)?),
+            Sha256::digest(fs::read(&applied_prefill)?)
+        );
+        if fs::read_to_string(&stamp).ok().as_deref()
+            == Some(format!("{inputs}\n{applied}").as_str())
+        {
             return Ok(overlay);
         }
     }
 
-    fs::create_dir_all(
-        destination
-            .parent()
-            .context("overlay header has no parent")?,
-    )
-    .context("failed to create FlashInfer prefill overlay")?;
-    fs::copy(&source, &destination).with_context(|| {
-        format!(
-            "failed to copy pinned FlashInfer header from {}",
-            source.display()
+    for relative in [scheduler_rel, prefill_rel] {
+        let source = flashinfer_root.join(relative);
+        let destination = overlay.join(relative);
+        fs::create_dir_all(
+            destination
+                .parent()
+                .context("overlay header has no parent")?,
         )
-    })?;
-
-    for check_only in [true, false] {
-        let mut command = Command::new("git");
-        command
-            .current_dir(std::env::temp_dir())
-            .arg("apply")
-            .arg("--unsafe-paths")
-            .arg(format!("--directory={}", overlay.display()));
-        if check_only {
-            command.arg("--check");
-        }
-        let output = command
-            .arg(&patch)
-            .output()
-            .context("failed to run git apply for FlashInfer overlay")?;
-        if !output.status.success() {
-            bail!(
-                "failed to {} FlashInfer prefill overlay patch: {}",
-                if check_only { "validate" } else { "apply" },
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+        .context("failed to create FlashInfer overlay")?;
+        fs::copy(&source, &destination).with_context(|| {
+            format!(
+                "failed to copy pinned FlashInfer header from {}",
+                source.display()
+            )
+        })?;
+    }
+    for patch in [&scheduler_patch, &prefill_patch] {
+        for check_only in [true, false] {
+            let mut command = Command::new("git");
+            command
+                .current_dir(std::env::temp_dir())
+                .arg("apply")
+                .arg("--unsafe-paths")
+                .arg(format!("--directory={}", overlay.display()));
+            if check_only {
+                command.arg("--check");
+            }
+            let output = command
+                .arg(patch)
+                .output()
+                .context("failed to run git apply for FlashInfer overlay")?;
+            if !output.status.success() {
+                bail!(
+                    "failed to {} FlashInfer overlay patch {}: {}",
+                    if check_only { "validate" } else { "apply" },
+                    patch.display(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
         }
     }
-
-    fs::write(
-        stamp,
-        format!("{inputs}\n{:x}", Sha256::digest(fs::read(&destination)?)),
-    )?;
+    let applied = format!(
+        "{:x}{:x}",
+        Sha256::digest(fs::read(&applied_scheduler)?),
+        Sha256::digest(fs::read(&applied_prefill)?)
+    );
+    fs::write(stamp, format!("{inputs}\n{applied}"))?;
     Ok(overlay)
 }

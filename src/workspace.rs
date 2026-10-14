@@ -41,6 +41,13 @@ use candle_core::cuda_backend::cudarc::driver::{sys, CudaSlice, DevicePtr};
 use candle_core::cuda_backend::WrapErr;
 use candle_core::Result;
 
+#[cfg(all(feature = "cuda", feature = "flashinfer"))]
+#[path = "dense_workspace.rs"]
+mod dense;
+
+#[cfg(all(feature = "cuda", feature = "flashinfer"))]
+pub(crate) use dense::{acquire_dense_plan_workspace, DensePlanWorkspaceGuard, RunWorkspaceLease};
+
 /// Total size of the disjoint plan and GEMM float regions (640 MiB).
 pub const WORKSPACE_FLOAT_SIZE: usize = FLASHINFER_PLAN_FLOAT_SIZE + GEMM_SCRATCH_FLOAT_SIZE;
 
@@ -179,6 +186,7 @@ pub fn add_workspace_offset(
 #[cfg(feature = "cuda")]
 mod cuda {
     use super::*;
+    #[cfg(feature = "cutlass")]
     use std::collections::HashMap;
 
     /// Page-locked host buffer for FlashInfer scheduler operations.
@@ -368,12 +376,9 @@ mod cuda {
         ws_cell.with(|ws| {
             let mut ws = ws.borrow_mut();
             let ordinal = dev.ordinal();
-
-            let needs_init = match ws.as_ref() {
-                None => true,
-                Some(existing) => existing.device_ordinal != ordinal,
-            };
-
+            let needs_init = ws
+                .as_ref()
+                .map_or(true, |workspace| workspace.device_ordinal != ordinal);
             if needs_init {
                 let float_buffer = unsafe { dev.alloc::<u8>(WORKSPACE_FLOAT_SIZE) }.w()?;
                 let int_buffer = unsafe { dev.alloc::<u8>(WORKSPACE_INT_SIZE) }.w()?;
@@ -385,8 +390,8 @@ mod cuda {
                     device_ordinal: ordinal,
                 });
             }
-
-            let workspace = ws.as_ref().unwrap();
+            let workspace = ws.as_ref().expect("FlashInfer workspace initialized");
+            debug_assert_eq!(workspace.device_ordinal, ordinal);
             Ok((
                 *workspace.float_buffer.device_ptr() as *mut std::ffi::c_void,
                 *workspace.int_buffer.device_ptr() as *mut std::ffi::c_void,

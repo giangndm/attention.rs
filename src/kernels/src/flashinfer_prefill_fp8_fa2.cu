@@ -206,13 +206,16 @@ void flashinfer_prefill_plan_fp8_fa2(
     void* workspace_int, size_t workspace_int_size,
     void* page_locked_int_buffer, size_t page_locked_int_size,
     int64_t* plan_info_out,
+    size_t* initialized_bytes_out,
     int64_t stream_i64)
 {
+    if (initialized_bytes_out != nullptr) *initialized_bytes_out = 0;
     #if defined(FLASHINFER_ENABLE_FP8_E4M3)
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_i64);
 
+    try {
     PrefillPlanInfo plan_info;
-    PrefillPlan<int32_t>(
+    cudaError_t status = PrefillPlan<int32_t>(
         workspace_float, workspace_float_size,
         workspace_int, page_locked_int_buffer, workspace_int_size,
         plan_info,
@@ -230,6 +233,10 @@ void flashinfer_prefill_plan_fp8_fa2(
         window_left > 0 ? window_left : -1, 0, false, static_cast<int64_t>(0),
         stream
     );
+    if (status != cudaSuccess) {
+        fprintf(stderr, "[flashinfer][prefill_plan_fp8_fa2] CUDA planning failed: %s\n", cudaGetErrorString(status));
+        return;
+    }
     if (!ValidatePrefillPlanInfoBounds(
             plan_info, workspace_float_size, workspace_int_size)) {
         return;
@@ -240,6 +247,16 @@ void flashinfer_prefill_plan_fp8_fa2(
         for (int i = 0; i < 15; ++i) {
             plan_info_out[1 + i] = vec[i];
         }
+    }
+    if (initialized_bytes_out != nullptr) {
+        *initialized_bytes_out = plan_info.initialized_integer_bytes;
+    }
+    } catch (const std::exception& error) {
+        if (initialized_bytes_out != nullptr) *initialized_bytes_out = 0;
+        fprintf(stderr, "[flashinfer][prefill_plan_fp8_fa2] planning failed: %.1024s\n", error.what());
+    } catch (...) {
+        if (initialized_bytes_out != nullptr) *initialized_bytes_out = 0;
+        fprintf(stderr, "[flashinfer][prefill_plan_fp8_fa2] planning failed: unknown exception\n");
     }
     #endif //FLASHINFER_ENABLE_FP8_E4M3
 }

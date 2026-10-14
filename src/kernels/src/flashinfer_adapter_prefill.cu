@@ -271,8 +271,10 @@ void flashinfer_prefill_plan_wrapper(
     void* workspace_int, size_t workspace_int_size,
     void* page_locked_buffer, size_t page_locked_size,
     int64_t* plan_info_out,
+    size_t* initialized_bytes_out,
     cudaStream_t stream)
 {
+    if (initialized_bytes_out != nullptr) *initialized_bytes_out = 0;
     if (plan_info_out == nullptr) {
         fprintf(stderr, "[flashinfer][prefill_plan] output pointer is null\n");
         return;
@@ -313,6 +315,9 @@ void flashinfer_prefill_plan_wrapper(
                 for (int i = 0; i < 9; ++i) {
                     plan_info_out[1 + i] = vec[i];
                 }
+                if (initialized_bytes_out != nullptr) {
+                    *initialized_bytes_out = plan_info.initialized_integer_bytes;
+                }
                 plan_info_out[0] = 1; // Publish only after conversion and copies succeed.
             }
         }
@@ -341,6 +346,9 @@ void flashinfer_prefill_plan_wrapper(
                 auto vec = plan_info.ToVector();
                 for (int i = 0; i < 15; ++i) {
                     plan_info_out[1 + i] = vec[i];
+                }
+                if (initialized_bytes_out != nullptr) {
+                    *initialized_bytes_out = plan_info.initialized_integer_bytes;
                 }
                 plan_info_out[0] = 0; // Publish only after conversion and copies succeed.
             }
